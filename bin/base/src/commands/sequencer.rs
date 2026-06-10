@@ -80,6 +80,7 @@ impl SequencerCommand {
             let overrides = ConsensusNodeOverrides {
                 l2_engine_rpc: Some(l2_engine_rpc),
                 l2_engine_jwt_secret: None,
+                upgrade_signal_runtime_validation: None,
             };
 
             let consensus_cancellation = CancellationToken::new();
