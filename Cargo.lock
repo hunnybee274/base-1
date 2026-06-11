@@ -6190,10 +6190,25 @@ name = "base-prover-zk-host"
 version = "0.0.0"
 dependencies = [
  "base-cli-utils",
+ "base-proof-succinct-host-utils",
+ "base-proof-succinct-proof-utils",
+ "base-proof-worker",
+ "base-proof-zk-backend",
+ "base-proof-zk-host",
+ "base-prover-service-client",
+ "base-prover-service-protocol",
  "clap",
  "eyre",
  "serde",
+ "sp1-cluster-artifact",
+ "sp1-cluster-common",
+ "sp1-cluster-utils",
+ "sp1-sdk",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
