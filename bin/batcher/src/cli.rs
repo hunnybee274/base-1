@@ -5,17 +5,19 @@ use std::{
     time::Duration,
 };
 
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::Address;
 use base_batcher_core::ThrottleConfig;
 use base_batcher_service::{BatcherConfig, BatcherService};
 use base_cli_utils::{LogConfig, RuntimeManager};
 use base_runtime::TokioRuntime;
+use base_tx_manager::SignerConfig;
 use clap::{Args, Parser, ValueEnum};
 use tracing::info;
 use url::Url;
 
 base_cli_utils::define_log_args!("BATCHER");
 base_cli_utils::define_metrics_args!("BATCHER", 7300);
+base_tx_manager::define_signer_cli!("BATCHER");
 
 /// The Base Batcher CLI.
 #[derive(Parser, Clone, Debug)]
@@ -87,9 +89,26 @@ pub(crate) struct BatcherArgs {
     )]
     pub rollup_rpc_url: Vec<Url>,
 
-    /// Batcher private key (hex-encoded 32-byte secret).
-    #[arg(long = "private-key", env = "BATCHER_PRIVATE_KEY")]
-    pub private_key: PrivateKeySigner,
+    /// Signer configuration.
+    #[command(flatten)]
+    pub signer: SignerCli,
+
+    /// Enable explicit shadow-mode guardrails for dangerous overrides.
+    ///
+    /// This flag does nothing by itself. It must be set together with
+    /// `--dangerously-override-batch-inbox-address` so canonical deployments
+    /// cannot accidentally redirect DA submissions.
+    #[arg(long = "shadow-mode", env = "BATCHER_SHADOW_MODE")]
+    pub shadow_mode: bool,
+
+    /// Dangerous shadow-mode batch inbox override.
+    ///
+    /// Requires `--shadow-mode`. Canonical deployments must not set this flag.
+    #[arg(
+        long = "dangerously-override-batch-inbox-address",
+        env = "BATCHER_DANGEROUSLY_OVERRIDE_BATCH_INBOX_ADDRESS"
+    )]
+    pub dangerously_override_batch_inbox_address: Option<Address>,
 
     /// L2 block polling interval in seconds.
     #[arg(long = "poll-interval", default_value = "1", env = "BATCHER_POLL_INTERVAL")]
@@ -267,6 +286,12 @@ pub(crate) struct BatcherArgs {
 impl BatcherArgs {
     /// Convert CLI arguments into a [`BatcherConfig`].
     fn into_config(self) -> eyre::Result<BatcherConfig> {
+        if self.shadow_mode != self.dangerously_override_batch_inbox_address.is_some() {
+            eyre::bail!(
+                "--shadow-mode and --dangerously-override-batch-inbox-address must be set together"
+            );
+        }
+        let signer = SignerConfig::try_from(self.signer)?;
         let frame_size = match self.da_type {
             base_batcher_encoder::DaType::Blob => self
                 .target_frame_size
@@ -291,7 +316,8 @@ impl BatcherArgs {
             l2_rpc_url: self.l2_rpc_url,
             l2_ws_url: self.l2_ws_url,
             rollup_rpc_url: self.rollup_rpc_url,
-            batcher_private_key: Some(self.private_key),
+            signer: Some(signer),
+            batch_inbox_override: self.dangerously_override_batch_inbox_address,
             poll_interval: Duration::from_secs(self.poll_interval_secs),
             encoder_config,
             max_pending_transactions: self.max_pending_transactions,
@@ -355,7 +381,7 @@ mod tests {
 
     use super::*;
 
-    fn base_args() -> Vec<&'static str> {
+    fn base_args_without_signer() -> Vec<&'static str> {
         vec![
             "base-batcher",
             "--l1-rpc-url",
@@ -364,9 +390,16 @@ mod tests {
             "http://localhost:9545",
             "--rollup-rpc-url",
             "http://localhost:7545",
+        ]
+    }
+
+    fn base_args() -> Vec<&'static str> {
+        let mut args = base_args_without_signer();
+        args.extend_from_slice(&[
             "--private-key",
             "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        ]
+        ]);
+        args
     }
 
     fn parse_cli(extra: &[&'static str]) -> Cli {
@@ -381,6 +414,59 @@ mod tests {
         let config = cli.args.into_config().expect("config should build");
 
         assert_eq!(config.encoder_config.batch_type, base_protocol::BatchType::Single);
+    }
+
+    #[test]
+    fn into_config_accepts_remote_signer() {
+        let mut args = base_args_without_signer();
+        args.extend_from_slice(&[
+            "--signer-endpoint",
+            "http://127.0.0.1:9000",
+            "--signer-address",
+            "0x4242424242424242424242424242424242424242",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("CLI should parse");
+        let config = cli.args.into_config().expect("config should build");
+
+        let signer = config.signer.expect("signer should be configured");
+        assert_eq!(signer.address(), Address::repeat_byte(0x42));
+    }
+
+    #[test]
+    fn into_config_rejects_shadow_mode_without_batch_inbox_override() {
+        let cli = parse_cli(&["--shadow-mode"]);
+        let err = cli.args.into_config().expect_err("shadow mode alone should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--shadow-mode and --dangerously-override-batch-inbox-address")
+        );
+    }
+
+    #[test]
+    fn into_config_rejects_batch_inbox_override_without_shadow_mode() {
+        let cli = parse_cli(&[
+            "--dangerously-override-batch-inbox-address",
+            "0x1111111111111111111111111111111111111111",
+        ]);
+        let err = cli.args.into_config().expect_err("override without shadow mode should fail");
+
+        assert!(
+            err.to_string()
+                .contains("--shadow-mode and --dangerously-override-batch-inbox-address")
+        );
+    }
+
+    #[test]
+    fn into_config_accepts_shadow_batch_inbox_override() {
+        let cli = parse_cli(&[
+            "--shadow-mode",
+            "--dangerously-override-batch-inbox-address",
+            "0x1111111111111111111111111111111111111111",
+        ]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.batch_inbox_override, Some(Address::repeat_byte(0x11)));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use base_common_consensus::BaseBlock;
 use base_common_network::Base;
 use base_consensus_rpc::RollupNodeApiClient;
 use base_runtime::TokioRuntime;
-use base_tx_manager::{BaseTxMetrics, SignerConfig, SimpleTxManager, TxManagerConfig};
+use base_tx_manager::{BaseTxMetrics, SimpleTxManager, TxManagerConfig};
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use tokio::sync::watch;
@@ -456,10 +456,20 @@ impl BatcherService {
                 .await
                 .map_err(|e| eyre::eyre!("optimism_rollupConfig RPC failed: {e}"))?,
         );
-        info!(
-            inbox = %rollup_config.batch_inbox_address,
-            "rollup config loaded"
-        );
+        let effective_batch_inbox =
+            self.config.batch_inbox_override.unwrap_or(rollup_config.batch_inbox_address);
+        if self.config.batch_inbox_override.is_some() {
+            warn!(
+                configured_inbox = %effective_batch_inbox,
+                rollup_config_inbox = %rollup_config.batch_inbox_address,
+                "using dangerous shadow batch inbox override"
+            );
+        } else {
+            info!(
+                inbox = %effective_batch_inbox,
+                "rollup config loaded"
+            );
+        }
 
         // Optionally block startup until the rollup node reports a non-zero
         // sync status. Mirrors the reference batcher's `--wait-node-sync`.
@@ -510,14 +520,14 @@ impl BatcherService {
         let scanned_highest = if self.config.check_recent_txs_depth > 0 {
             let batcher_address = self
                 .config
-                .batcher_private_key
+                .signer
                 .as_ref()
-                .ok_or_else(|| eyre::eyre!("batcher_private_key must be set before starting"))?
+                .ok_or_else(|| eyre::eyre!("signer must be set before starting"))?
                 .address();
             RecentTxScanner::highest_submitted_l2_block(
                 &l1_provider,
                 batcher_address,
-                rollup_config.batch_inbox_address,
+                effective_batch_inbox,
                 self.config.check_recent_txs_depth,
                 &rollup_config,
             )
@@ -595,12 +605,9 @@ impl BatcherService {
             self.config.poll_interval,
         );
 
-        // Build the signer config from the configured private key.
-        let signer_config = SignerConfig::local(
-            self.config
-                .batcher_private_key
-                .ok_or_else(|| eyre::eyre!("batcher_private_key must be set before starting"))?,
-        );
+        // Build the signer config from the configured local key or remote signer.
+        let signer_config =
+            self.config.signer.ok_or_else(|| eyre::eyre!("signer must be set before starting"))?;
 
         // Fetch L1 chain ID and construct the tx manager.
         let l1_chain_id = l1_provider
@@ -640,7 +647,7 @@ impl BatcherService {
             source,
             tx_manager,
             base_batcher_core::BatchDriverConfig {
-                inbox: rollup_config.batch_inbox_address,
+                inbox: effective_batch_inbox,
                 max_pending_transactions: self.config.max_pending_transactions,
                 drain_timeout: self.config.resubmission_timeout * 2,
                 force_blobs_when_throttling: self.config.force_blobs_when_throttling,

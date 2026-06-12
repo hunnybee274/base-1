@@ -2,16 +2,18 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::Address;
 use base_batcher_core::ThrottleConfig;
 use base_batcher_encoder::EncoderConfig;
+use base_tx_manager::SignerConfig;
 use url::Url;
 
 /// Full batcher configuration combining RPC endpoints, identity, encoding
 /// parameters, submission limits, and optional throttling.
 ///
-/// The batch inbox address is sourced from the rollup config fetched at startup
-/// via `optimism_rollupConfig`, so it is not stored here.
+/// By default the batch inbox address is sourced from the rollup config fetched
+/// at startup via `optimism_rollupConfig`. Shadow deployments may set
+/// [`batch_inbox_override`](Self::batch_inbox_override) to submit to a non-canonical inbox.
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
     /// L1 RPC endpoint(s).
@@ -45,11 +47,18 @@ pub struct BatcherConfig {
     /// Same connection-time failover semantics as [`l1_rpc_url`](Self::l1_rpc_url).
     /// Must be non-empty.
     pub rollup_rpc_url: Vec<Url>,
-    /// Private key for signing L1 transactions.
+    /// Signer configuration for signing L1 transactions.
     ///
     /// Must be `Some` before the batcher is started; a `None` value will cause
-    /// startup to fail with a clear error rather than proceeding with a random key.
-    pub batcher_private_key: Option<PrivateKeySigner>,
+    /// startup to fail with a clear error rather than proceeding without an L1 identity.
+    pub signer: Option<SignerConfig>,
+    /// Dangerous shadow-mode batch inbox override.
+    ///
+    /// When set, the batcher still reads the canonical rollup config from the rollup
+    /// RPC, but submits L1 transactions to this address instead of
+    /// `rollup_config.batch_inbox_address`. This is only intended for explicit
+    /// shadow deployments; canonical deployments must leave it unset.
+    pub batch_inbox_override: Option<Address>,
     /// L2 block polling interval.
     pub poll_interval: Duration,
     /// Encoder configuration.
@@ -111,7 +120,8 @@ impl Default for BatcherConfig {
             l2_rpc_url: vec!["http://localhost:9545".parse().expect("valid default URL")],
             l2_ws_url: None,
             rollup_rpc_url: vec!["http://localhost:7545".parse().expect("valid default URL")],
-            batcher_private_key: None,
+            signer: None,
+            batch_inbox_override: None,
             poll_interval: Duration::from_secs(1),
             encoder_config: EncoderConfig::default(),
             max_pending_transactions: 1,

@@ -3265,6 +3265,7 @@ dependencies = [
  "base-cli-utils",
  "base-protocol",
  "base-runtime",
+ "base-tx-manager",
  "clap",
  "eyre",
  "serde",
@@ -3318,6 +3319,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-batcher-parity"
+version = "0.0.0"
+dependencies = [
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "alloy-rlp",
+ "base-blobs",
+ "base-common-genesis",
+ "base-protocol",
+ "miniz_oxide 0.9.1",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "base-batcher-parity-bin"
+version = "0.0.0"
+dependencies = [
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "base-batcher-parity",
+ "base-common-chains",
+ "base-common-genesis",
+ "clap",
+ "eyre",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "base-batcher-service"
 version = "0.0.0"
 dependencies = [
@@ -3326,7 +3357,6 @@ dependencies = [
  "alloy-provider 2.0.5",
  "alloy-rlp",
  "alloy-rpc-types-eth 2.0.5",
- "alloy-signer-local 2.0.5",
  "async-trait",
  "base-batcher-admin",
  "base-batcher-core",

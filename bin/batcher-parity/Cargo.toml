@@ -1,0 +1,27 @@
+[package]
+name = "base-batcher-parity-bin"
+description = "Base Batcher normalized parity comparator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "base-batcher-parity"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+eyre.workspace = true
+base-common-chains = { workspace = true, features = ["std"] }
+base-common-genesis = { workspace = true, features = ["std"] }
+base-batcher-parity.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+alloy-eips = { workspace = true, features = ["std"] }
+alloy-primitives = { workspace = true, features = ["std"] }
