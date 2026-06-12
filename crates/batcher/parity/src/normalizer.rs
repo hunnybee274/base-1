@@ -1,6 +1,6 @@
 //! Submission normalization and comparison.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use alloy_eips::eip4844::Blob;
 use alloy_primitives::keccak256;
@@ -52,11 +52,13 @@ impl ParityNormalizer {
         let mut rejected_frames = 0usize;
 
         for frame in frames {
-            if !channels.contains_key(&frame.id) {
-                channel_order.push(frame.id);
-                channels.insert(frame.id, Channel::new(frame.id, block_info));
-            }
-            let channel = channels.get_mut(&frame.id).expect("channel must exist");
+            let channel = match channels.entry(frame.id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    channel_order.push(frame.id);
+                    entry.insert(Channel::new(frame.id, block_info))
+                }
+            };
             if channel.add_frame(frame.clone(), block_info).is_err() {
                 rejected_frames += 1;
             }
