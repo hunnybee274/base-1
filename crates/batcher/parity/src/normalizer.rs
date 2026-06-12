@@ -27,7 +27,7 @@ impl ParityNormalizer {
         rollup_config: &RollupConfig,
     ) -> Result<NormalizedSubmission, ParityError> {
         let frames = Frame::parse_frames(data)?;
-        Ok(Self::normalize_frames(&frames, inclusion_timestamp, rollup_config))
+        Ok(Self::normalize_frames(frames, inclusion_timestamp, rollup_config))
     }
 
     /// Normalize a blob submission payload.
@@ -42,7 +42,7 @@ impl ParityNormalizer {
 
     /// Normalize already-decoded frames.
     pub fn normalize_frames(
-        frames: &[Frame],
+        frames: impl IntoIterator<Item = Frame>,
         inclusion_timestamp: u64,
         rollup_config: &RollupConfig,
     ) -> NormalizedSubmission {
@@ -52,14 +52,15 @@ impl ParityNormalizer {
         let mut rejected_frames = 0usize;
 
         for frame in frames {
-            let channel = match channels.entry(frame.id) {
+            let frame_id = frame.id;
+            let channel = match channels.entry(frame_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    channel_order.push(frame.id);
-                    entry.insert(Channel::new(frame.id, block_info))
+                    channel_order.push(frame_id);
+                    entry.insert(Channel::new(frame_id, block_info))
                 }
             };
-            if channel.add_frame(frame.clone(), block_info).is_err() {
+            if channel.add_frame(frame, block_info).is_err() {
                 rejected_frames += 1;
             }
         }
@@ -90,7 +91,8 @@ impl ParityNormalizer {
         rollup_config: &RollupConfig,
     ) -> Vec<NormalizedBatch> {
         let Some(data) = channel.frame_data() else { return Vec::new() };
-        let max_rlp = rollup_config.max_rlp_bytes_per_channel(inclusion_timestamp) as usize;
+        let max_rlp = usize::try_from(rollup_config.max_rlp_bytes_per_channel(inclusion_timestamp))
+            .expect("max RLP bytes per channel must fit in usize");
         let brotli_supported = rollup_config.is_fjord_active(inclusion_timestamp);
         let mut reader = BatchReader::new(data.to_vec(), max_rlp, brotli_supported);
         let mut batches = Vec::new();
@@ -280,7 +282,7 @@ mod tests {
             single_frame([1u8; Channel::ID_LENGTH], encode_single_batch(&second_batch)),
         ];
 
-        let normalized = ParityNormalizer::normalize_frames(&frames, 0, &rollup_config);
+        let normalized = ParityNormalizer::normalize_frames(frames, 0, &rollup_config);
 
         assert_eq!(normalized.batches.len(), 2);
         assert_eq!(normalized.batches[0].start_timestamp, 1000);

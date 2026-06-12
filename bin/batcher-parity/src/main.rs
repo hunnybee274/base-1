@@ -28,11 +28,11 @@ struct Cli {
     right_calldata_hex: Option<String>,
 
     /// Left EIP-4844 blob as hex.
-    #[arg(long = "left-blob-hex", conflicts_with = "left_calldata_hex")]
+    #[arg(long = "left-blob-hex")]
     left_blob_hex: Option<String>,
 
     /// Right EIP-4844 blob as hex.
-    #[arg(long = "right-blob-hex", conflicts_with = "right_calldata_hex")]
+    #[arg(long = "right-blob-hex")]
     right_blob_hex: Option<String>,
 }
 

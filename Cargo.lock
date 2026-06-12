@@ -6346,6 +6346,7 @@ dependencies = [
  "base-protocol",
  "base-runtime",
  "base-tx-forwarding",
+ "base-tx-manager",
  "base-txpool-rpc",
  "base-txpool-tracing",
  "base-zk-client",
