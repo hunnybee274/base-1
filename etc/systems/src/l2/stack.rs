@@ -6,6 +6,8 @@
 //! - Batcher (in-process, submits L2 transaction batches to L1)
 //! - Client execution layer (in-process, follows the L2 and builds pending state using Flashblocks)
 
+use std::time::Duration;
+
 use alloy_genesis::ChainConfig;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::JwtSecret;
@@ -18,9 +20,20 @@ use url::Url;
 use super::{
     InProcessBatcher, InProcessBatcherConfig, InProcessBuilder, InProcessBuilderConfig,
     InProcessClient, InProcessClientConfig, InProcessConsensus, InProcessConsensusConfig,
-    L2ContainerConfig,
+    InProcessFollowConsensus, InProcessFollowConsensusConfig, L2ContainerConfig,
+    RequestsHashStrippingSourceRpcProxy, RequestsHashStrippingSourceRpcProxyConfig,
 };
 use crate::config::SEQUENCER;
+
+/// Consensus mode used by the L2 client node.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum L2ClientConsensusMode {
+    /// Run the client consensus node as a normal validator.
+    #[default]
+    Validator,
+    /// Run the client consensus node in follow mode against the builder RPC.
+    Follow,
+}
 
 /// Configuration for the L2 stack.
 #[derive(Debug, Clone)]
@@ -51,6 +64,29 @@ pub struct L2StackConfig {
     /// Number of L1 blocks to keep distance from the L1 head for the client (validator)
     /// consensus node's derivation pipeline.
     pub verifier_l1_confs: u64,
+    /// Consensus mode for the L2 client node.
+    pub client_consensus_mode: L2ClientConsensusMode,
+    /// Strips `requestsHash` from the follow-mode source RPC to emulate source nodes that omit it.
+    pub strip_follow_source_requests_hash: bool,
+}
+
+/// Running L2 client consensus node.
+#[derive(Debug)]
+pub enum L2ClientConsensus {
+    /// Standard validator consensus node.
+    Validator(InProcessConsensus),
+    /// Follow-mode consensus node.
+    Follow(InProcessFollowConsensus),
+}
+
+impl L2ClientConsensus {
+    /// Returns the RPC URL for this consensus node.
+    pub fn rpc_url(&self) -> Url {
+        match self {
+            Self::Validator(consensus) => consensus.rpc_url(),
+            Self::Follow(consensus) => consensus.rpc_url(),
+        }
+    }
 }
 
 /// A complete L2 network stack composed of Builder + Consensus + Batcher.
@@ -65,14 +101,15 @@ pub struct L2StackConfig {
 /// 2. Builder consensus node connects to builder's engine API (in-process CL, Sequencer mode)
 /// 3. Batcher connects to builder RPC and builder consensus RPC
 /// 4. Client starts (in-process EL)
-/// 5. Client consensus node connects to client's engine API (in-process CL, Validator mode)
-/// 6. Client consensus connects to builder consensus via P2P
+/// 5. Client consensus node connects to client's engine API
+/// 6. Validator-mode client consensus connects to builder consensus via P2P
 pub struct L2Stack {
     builder: InProcessBuilder,
     builder_consensus: InProcessConsensus,
     batcher: InProcessBatcher,
     client: InProcessClient,
-    client_consensus: InProcessConsensus,
+    client_consensus: L2ClientConsensus,
+    follow_source_rpc_proxy: Option<RequestsHashStrippingSourceRpcProxy>,
 }
 
 impl std::fmt::Debug for L2Stack {
@@ -83,6 +120,7 @@ impl std::fmt::Debug for L2Stack {
             .field("batcher", &self.batcher)
             .field("client", &self.client)
             .field("client_consensus", &self.client_consensus)
+            .field("follow_source_rpc_proxy", &self.follow_source_rpc_proxy)
             .finish()
     }
 }
@@ -184,43 +222,88 @@ impl L2Stack {
             .await
             .wrap_err("Failed to start in-process client")?;
 
-        // 5. Start client consensus (in-process CL, Validator mode).
-        let client_consensus_config = InProcessConsensusConfig {
-            rollup_config,
-            l1_chain_config,
-            jwt_secret: config.jwt_secret,
-            l1_rpc_url,
-            l1_beacon_url,
-            l2_engine_url: client.engine_url()?,
-            mode: NodeMode::Validator,
-            sequencer_key: None,
-            p2p_key: None,
-            rpc_port: container_config.and_then(|c| c.client_consensus_rpc_port),
-            p2p_tcp_port: container_config.and_then(|c| c.client_consensus_p2p_tcp_port),
-            p2p_udp_port: container_config.and_then(|c| c.client_consensus_p2p_udp_port),
-            unsafe_block_signer: SEQUENCER.address,
-            l1_slot_duration_override: Some(4),
-            sequencer_stopped: false,
-            verifier_l1_confs: config.verifier_l1_confs,
+        // 5. Start client consensus.
+        let (client_consensus, follow_source_rpc_proxy) = match config.client_consensus_mode {
+            L2ClientConsensusMode::Validator => {
+                let client_consensus_config = InProcessConsensusConfig {
+                    rollup_config,
+                    l1_chain_config,
+                    jwt_secret: config.jwt_secret,
+                    l1_rpc_url,
+                    l1_beacon_url,
+                    l2_engine_url: client.engine_url()?,
+                    mode: NodeMode::Validator,
+                    sequencer_key: None,
+                    p2p_key: None,
+                    rpc_port: container_config.and_then(|c| c.client_consensus_rpc_port),
+                    p2p_tcp_port: container_config.and_then(|c| c.client_consensus_p2p_tcp_port),
+                    p2p_udp_port: container_config.and_then(|c| c.client_consensus_p2p_udp_port),
+                    unsafe_block_signer: SEQUENCER.address,
+                    l1_slot_duration_override: Some(4),
+                    sequencer_stopped: false,
+                    verifier_l1_confs: config.verifier_l1_confs,
+                };
+                let client_consensus = InProcessConsensus::start(client_consensus_config)
+                    .await
+                    .wrap_err("Failed to start client consensus")?;
+
+                // Connect the client consensus to the builder consensus via P2P.
+                let builder_p2p_addr = builder_consensus.p2p_addr();
+                client_consensus
+                    .connect_peer(&builder_p2p_addr)
+                    .await
+                    .wrap_err("Failed to connect client consensus to builder consensus")?;
+                (L2ClientConsensus::Validator(client_consensus), None)
+            }
+            L2ClientConsensusMode::Follow => {
+                let follow_source_rpc_proxy = if config.strip_follow_source_requests_hash {
+                    Some(
+                        RequestsHashStrippingSourceRpcProxy::start(
+                            RequestsHashStrippingSourceRpcProxyConfig {
+                                source_l2_rpc_url: builder.rpc_url()?,
+                                rpc_port: None,
+                            },
+                        )
+                        .await
+                        .wrap_err("Failed to start source RPC proxy")?,
+                    )
+                } else {
+                    None
+                };
+                let source_l2_rpc_url = follow_source_rpc_proxy
+                    .as_ref()
+                    .map_or_else(|| builder.rpc_url(), |proxy| Ok(proxy.rpc_url()))?;
+                let client_consensus_config = InProcessFollowConsensusConfig {
+                    rollup_config,
+                    jwt_secret: config.jwt_secret,
+                    l1_rpc_url,
+                    local_l2_rpc_url: client.rpc_url()?,
+                    source_l2_rpc_url,
+                    l2_engine_url: client.engine_url()?,
+                    rpc_port: container_config.and_then(|c| c.client_consensus_rpc_port),
+                    insert_delay: Duration::ZERO,
+                };
+                let client_consensus = InProcessFollowConsensus::start(client_consensus_config)
+                    .await
+                    .wrap_err("Failed to start follow client consensus")?;
+                (L2ClientConsensus::Follow(client_consensus), follow_source_rpc_proxy)
+            }
         };
-        let client_consensus = InProcessConsensus::start(client_consensus_config)
-            .await
-            .wrap_err("Failed to start client consensus")?;
 
-        // 6. Connect the client consensus to the builder consensus via P2P.
-        let builder_p2p_addr = builder_consensus.p2p_addr();
-        client_consensus
-            .connect_peer(&builder_p2p_addr)
-            .await
-            .wrap_err("Failed to connect client consensus to builder consensus")?;
-
-        // 7. Start the sequencer now that peers are connected, ensuring no blocks are missed.
+        // 6. Start the sequencer after the client consensus is ready.
         builder_consensus
             .start_sequencer()
             .await
             .wrap_err("Failed to start sequencer after peer connection")?;
 
-        Ok(Self { builder, builder_consensus, batcher, client, client_consensus })
+        Ok(Self {
+            builder,
+            builder_consensus,
+            batcher,
+            client,
+            client_consensus,
+            follow_source_rpc_proxy,
+        })
     }
 
     /// Returns a reference to the in-process builder.
@@ -241,6 +324,11 @@ impl L2Stack {
     /// Returns a reference to the in-process client.
     pub const fn client(&self) -> &InProcessClient {
         &self.client
+    }
+
+    /// Returns a reference to the client's consensus node.
+    pub const fn client_consensus(&self) -> &L2ClientConsensus {
+        &self.client_consensus
     }
 
     /// Returns the builder's HTTP RPC URL.

@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     BATCHER, BUILDER, SEQUENCER,
     l1::{L1ContainerConfig, L1Stack, L1StackConfig},
-    l2::{L2ContainerConfig, L2Stack, L2StackConfig},
+    l2::{L2ClientConsensusMode, L2ContainerConfig, L2Stack, L2StackConfig},
     setup::{L1GenesisOutput, L2DeploymentOutput, SetupContainer},
     system_config::StableSystemTestConfig,
 };
@@ -127,12 +127,15 @@ pub struct SystemTestStackBuilder {
     l1_chain_id: Option<u64>,
     l2_chain_id: Option<u64>,
     slot_duration: Option<u64>,
+    isthmus_activation_block: Option<u64>,
     base_azul_activation_block: Option<u64>,
     base_beryl_activation_block: Option<u64>,
     output_dir: Option<PathBuf>,
     stable_config: Option<StableSystemTestConfig>,
     tx_forwarding_config: Option<TxForwardingConfig>,
     verifier_l1_confs: u64,
+    client_consensus_mode: L2ClientConsensusMode,
+    strip_follow_source_requests_hash: bool,
 }
 
 impl SystemTestStackBuilder {
@@ -156,6 +159,12 @@ impl SystemTestStackBuilder {
     /// Sets the slot duration.
     pub const fn with_slot_duration(mut self, slot_duration: u64) -> Self {
         self.slot_duration = Some(slot_duration);
+        self
+    }
+
+    /// Sets the L2 block number at which Isthmus activates.
+    pub const fn with_isthmus_activation_block(mut self, block: u64) -> Self {
+        self.isthmus_activation_block = Some(block);
         self
     }
 
@@ -198,6 +207,24 @@ impl SystemTestStackBuilder {
         self
     }
 
+    /// Sets the consensus mode used by the L2 client node.
+    pub const fn with_client_consensus_mode(mut self, mode: L2ClientConsensusMode) -> Self {
+        self.client_consensus_mode = mode;
+        self
+    }
+
+    /// Runs the L2 client consensus node in follow mode against the builder RPC.
+    pub const fn with_follow_mode_client_consensus(mut self) -> Self {
+        self.client_consensus_mode = L2ClientConsensusMode::Follow;
+        self
+    }
+
+    /// Strips `requestsHash` from follow-mode source RPC block responses.
+    pub const fn with_stripped_follow_source_requests_hash(mut self) -> Self {
+        self.strip_follow_source_requests_hash = true;
+        self
+    }
+
     /// Builds and starts the system test stack.
     pub async fn build(self) -> Result<SystemTestStack> {
         let l1_chain_id = self.l1_chain_id.unwrap_or(DEFAULT_L1_CHAIN_ID);
@@ -211,6 +238,10 @@ impl SystemTestStackBuilder {
             .with_chain_id(l1_chain_id)
             .with_l2_chain_id(l2_chain_id)
             .with_slot_duration(slot_duration);
+
+        if let Some(block) = self.isthmus_activation_block {
+            setup = setup.with_isthmus_activation_block(block);
+        }
 
         if let Some(block) = self.base_azul_activation_block {
             setup = setup.with_base_azul_activation_block(block);
@@ -305,6 +336,8 @@ impl SystemTestStackBuilder {
             container_config: l2_container_config,
             tx_forwarding_config: self.tx_forwarding_config,
             verifier_l1_confs: self.verifier_l1_confs,
+            client_consensus_mode: self.client_consensus_mode,
+            strip_follow_source_requests_hash: self.strip_follow_source_requests_hash,
         };
 
         let l2_stack = L2Stack::start(l2_config).await.wrap_err("Failed to start L2 stack")?;

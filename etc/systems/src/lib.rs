@@ -49,7 +49,9 @@ mod l2;
 pub use l2::{
     InProcessBatcher, InProcessBatcherConfig, InProcessBuilder, InProcessBuilderConfig,
     InProcessClient, InProcessClientConfig, InProcessConsensus, InProcessConsensusConfig,
-    L2ContainerConfig, L2Stack, L2StackConfig,
+    InProcessFollowConsensus, InProcessFollowConsensusConfig, L2ClientConsensus,
+    L2ClientConsensusMode, L2ContainerConfig, L2Stack, L2StackConfig,
+    RequestsHashStrippingSourceRpcProxy, RequestsHashStrippingSourceRpcProxyConfig,
 };
 
 mod network;
