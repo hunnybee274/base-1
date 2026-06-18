@@ -65,23 +65,20 @@ impl ConsensusNodeCommand {
             CliMetrics::init_p2p(&args.config.p2p_flags);
         }
 
-        let manager = RuntimeManager::new();
-        let rt = manager.tokio_runtime()?;
+        let rt = RuntimeManager::new().tokio_runtime()?;
         // Build the subscriber — including the gRPC OTLP layer — inside the main runtime
         // so tonic's transport channel lives for the full program lifetime (reth pattern).
-        rt.block_on(async {
-            LogConfig::from(self.logging.clone())
-                .init_with_trace_args(&mut self.traces, &["libp2p_gossipsub=error"])
-        })?;
         rt.block_on(async move {
-            tokio::select! {
-                biased;
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!(target: "cli", "Received Ctrl-C, shutting down...");
-                    Ok(())
-                }
-                res = args.start_with_overrides(cfg, Default::default()) => res,
-            }
+            LogConfig::from(self.logging.clone())
+                .init_with_trace_args(&mut self.traces, &["libp2p_gossipsub=error"])?;
+
+            let cancellation = CancellationToken::new();
+            let signal_handle = RuntimeManager::install_signal_handler(cancellation.clone());
+            let result = args
+                .start_with_overrides_and_cancellation(cfg, Default::default(), cancellation)
+                .await;
+            signal_handle.abort();
+            result
         })
     }
 }
