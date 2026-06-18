@@ -499,16 +499,15 @@ impl BatchPipeline for BatchEncoder {
 
         // If there are no blocks to encode, we're idle.
         if self.block_cursor >= self.blocks.len() {
-            if self.config.batch_type == BatchType::Span {
-                if let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch {
-                    if self.span_accumulator.len() >= max_blocks_per_span_batch {
-                        if !self.flush_span_accumulator_to_channel() {
-                            self.close_open_channel("size_full");
-                            return Ok(StepResult::ChannelClosed);
-                        }
-                        return Ok(StepResult::BlockEncoded);
-                    }
+            if self.config.batch_type == BatchType::Span
+                && let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch
+                && self.span_accumulator.len() >= max_blocks_per_span_batch
+            {
+                if !self.flush_span_accumulator_to_channel() {
+                    self.close_open_channel("size_full");
+                    return Ok(StepResult::ChannelClosed);
                 }
+                return Ok(StepResult::BlockEncoded);
             }
 
             return Ok(StepResult::Idle);
@@ -567,19 +566,19 @@ impl BatchPipeline for BatchEncoder {
                     "accumulated block for span batch"
                 );
 
-                if let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch {
-                    if self.span_accumulator.len() >= max_blocks_per_span_batch {
-                        debug!(
-                            span_len = self.span_accumulator.len(),
-                            max_blocks_per_span_batch,
-                            "span accumulator reached max block count, flushing span batch"
-                        );
-                        if !self.flush_span_accumulator_to_channel() {
-                            self.close_open_channel("size_full");
-                            return Ok(StepResult::ChannelClosed);
-                        }
-                        return Ok(StepResult::BlockEncoded);
+                if let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch
+                    && self.span_accumulator.len() >= max_blocks_per_span_batch
+                {
+                    debug!(
+                        span_len = self.span_accumulator.len(),
+                        max_blocks_per_span_batch,
+                        "span accumulator reached max block count, flushing span batch"
+                    );
+                    if !self.flush_span_accumulator_to_channel() {
+                        self.close_open_channel("size_full");
+                        return Ok(StepResult::ChannelClosed);
                     }
+                    return Ok(StepResult::BlockEncoded);
                 }
 
                 if compressed_estimate >= size_target {
