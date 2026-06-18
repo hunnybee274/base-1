@@ -57,6 +57,10 @@ pub struct BatcherConfig {
     /// Must be `Some` before the batcher is started; a `None` value will cause
     /// startup to fail with a clear error rather than proceeding without an L1 identity.
     pub signer: Option<SignerConfig>,
+    /// Whether Prometheus metrics are enabled for this service.
+    ///
+    /// When enabled, the service starts the signer account balance monitor.
+    pub metrics_enabled: bool,
     /// Dangerous shadow-mode batch inbox override.
     ///
     /// When set, the batcher still reads the canonical rollup config from the rollup
@@ -127,6 +131,7 @@ impl Default for BatcherConfig {
             rollup_rpc_url: vec!["http://localhost:7545".parse().expect("valid default URL")],
             l1_beacon_url: None,
             signer: None,
+            metrics_enabled: false,
             batch_inbox_override: None,
             poll_interval: Duration::from_secs(1),
             encoder_config: EncoderConfig::default(),

@@ -324,6 +324,7 @@ impl BatcherArgs {
             rollup_rpc_url: self.rollup_rpc_url,
             l1_beacon_url: self.l1_beacon_url,
             signer: Some(signer),
+            metrics_enabled: self.metrics.enabled,
             batch_inbox_override: self.dangerously_override_batch_inbox_address,
             poll_interval: Duration::from_secs(self.poll_interval_secs),
             encoder_config,
@@ -437,6 +438,14 @@ mod tests {
 
         let signer = config.signer.expect("signer should be configured");
         assert_eq!(signer.address(), Address::repeat_byte(0x42));
+    }
+
+    #[test]
+    fn into_config_sets_metrics_enabled() {
+        let cli = parse_cli(&["--metrics.enabled"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert!(config.metrics_enabled);
     }
 
     #[test]

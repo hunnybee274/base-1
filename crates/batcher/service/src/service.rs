@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_provider::{Provider, ProviderBuilder, ProviderLayer, RootProvider};
 use alloy_rpc_types_eth::BlockNumberOrTag;
+use base_balance_monitor::BalanceMonitorLayer;
 use base_batcher_admin::AdminServer;
 use base_batcher_core::{
     AdminHandle, BatchDriver, DaThrottle, NoopThrottleClient, ThrottleClient, ThrottleConfig,
     ThrottleController, ThrottleStrategy,
 };
-use base_batcher_encoder::BatchEncoder;
+use base_batcher_encoder::{BatchEncoder, BatcherMetrics};
 use base_batcher_source::{BlockSubscription, HybridBlockSource, HybridL1HeadSource, SourceError};
 use base_common_consensus::BaseBlock;
 use base_common_network::Base;
@@ -27,6 +28,8 @@ use crate::{
     RecentTxScanner, RpcL1HeadPollingSource, RpcPollingSource, RpcThrottleClient, SafeHeadPoller,
     ShadowParityMonitor, ShadowParityMonitorConfig, WsBlockSubscription, WsL1HeadSubscription,
 };
+
+const WEI_PER_ETHER: f64 = 1_000_000_000_000_000_000.0;
 
 /// Service-internal throttle client variant: either a no-op or an RPC client.
 ///
@@ -394,6 +397,13 @@ impl BatcherService {
             eyre::bail!("at least one rollup RPC endpoint is required");
         }
 
+        let signer_config = self
+            .config
+            .signer
+            .clone()
+            .ok_or_else(|| eyre::eyre!("signer must be set before starting"))?;
+        let signer_address = signer_config.address();
+
         info!(
             l1_rpc_count = self.config.l1_rpc_url.len(),
             l2_rpc_count = self.config.l2_rpc_url.len(),
@@ -513,6 +523,25 @@ impl BatcherService {
             })
             .await?;
 
+        if self.config.metrics_enabled {
+            let (layer, mut balance_rx) = BalanceMonitorLayer::new(
+                signer_address,
+                runtime.token().clone(),
+                BalanceMonitorLayer::DEFAULT_POLL_INTERVAL,
+            );
+            let _ = layer.layer(l1_provider.clone());
+            tokio::spawn(async move {
+                while balance_rx.changed().await.is_ok() {
+                    let balance_ether = f64::from(*balance_rx.borrow_and_update()) / WEI_PER_ETHER;
+                    BatcherMetrics::balance().set(balance_ether);
+                }
+            });
+            info!(
+                address = %signer_address,
+                "batcher balance monitor started"
+            );
+        }
+
         if let Some(shadow_inbox) = self.config.batch_inbox_override {
             if shadow_inbox == rollup_config.batch_inbox_address {
                 warn!(
@@ -627,10 +656,6 @@ impl BatcherService {
             l1_head_poller,
             self.config.poll_interval,
         );
-
-        // Build the signer config from the configured local key or remote signer.
-        let signer_config =
-            self.config.signer.ok_or_else(|| eyre::eyre!("signer must be set before starting"))?;
 
         // Fetch L1 chain ID and construct the tx manager.
         let l1_chain_id = l1_provider

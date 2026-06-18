@@ -3343,6 +3343,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth 2.0.5",
  "async-trait",
+ "base-balance-monitor",
  "base-batcher-admin",
  "base-batcher-core",
  "base-batcher-encoder",
