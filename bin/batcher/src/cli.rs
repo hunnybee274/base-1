@@ -140,6 +140,10 @@ pub(crate) struct BatcherArgs {
     #[arg(long = "target-num-frames", default_value = "1", env = "BATCHER_TARGET_NUM_FRAMES")]
     pub target_num_frames: usize,
 
+    /// Maximum number of L2 blocks to accumulate into one span batch.
+    #[arg(long = "max-blocks-per-span-batch", env = "BATCHER_MAX_BLOCKS_PER_SPAN_BATCH")]
+    pub max_blocks_per_span_batch: Option<usize>,
+
     /// Batch encoding mode.
     ///
     /// Accepts `single` / `0` and `span` / `1`. Span batches require Fjord
@@ -310,6 +314,7 @@ impl BatcherArgs {
             max_channel_duration: self.max_channel_duration,
             sub_safety_margin: self.sub_safety_margin,
             target_num_frames: self.target_num_frames,
+            max_blocks_per_span_batch: self.max_blocks_per_span_batch,
             batch_type: self.batch_type.into(),
             da_type: self.da_type,
             approx_compr_ratio: self.approx_compr_ratio,
@@ -491,6 +496,22 @@ mod tests {
         let config = cli.args.into_config().expect("config should build");
 
         assert_eq!(config.encoder_config.batch_type, base_protocol::BatchType::Span);
+    }
+
+    #[test]
+    fn into_config_accepts_max_blocks_per_span_batch() {
+        let cli = parse_cli(&["--max-blocks-per-span-batch", "2"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.max_blocks_per_span_batch, Some(2));
+    }
+
+    #[test]
+    fn into_config_rejects_zero_max_blocks_per_span_batch() {
+        let cli = parse_cli(&["--max-blocks-per-span-batch", "0"]);
+        let err = cli.args.into_config().expect_err("zero span batch block cap should fail");
+
+        assert!(err.to_string().contains("max_blocks_per_span_batch"));
     }
 
     #[test]

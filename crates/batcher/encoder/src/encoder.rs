@@ -548,6 +548,18 @@ impl BatchPipeline for BatchEncoder {
                     "accumulated block for span batch"
                 );
 
+                if let Some(max_blocks_per_span_batch) = self.config.max_blocks_per_span_batch {
+                    if self.span_accumulator.len() >= max_blocks_per_span_batch {
+                        debug!(
+                            span_len = self.span_accumulator.len(),
+                            max_blocks_per_span_batch,
+                            "span accumulator reached max block count, closing channel"
+                        );
+                        self.close_current_channel("max_blocks");
+                        return Ok(StepResult::ChannelClosed);
+                    }
+                }
+
                 if compressed_estimate >= size_target {
                     debug!(
                         span_len = self.span_accumulator.len(),
@@ -1652,6 +1664,53 @@ mod tests {
         // A submission must be immediately available.
         let sub = encoder.next_submission();
         assert!(sub.is_some(), "span batch should produce a submission after size-based close");
+    }
+
+    #[test]
+    fn test_span_batch_max_blocks_triggers_close() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let config = EncoderConfig {
+            batch_type: BatchType::Span,
+            target_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE, // large: size won't trigger
+            max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
+            max_channel_duration: 1000,
+            max_blocks_per_span_batch: Some(2),
+            ..EncoderConfig::default()
+        };
+        let mut encoder = BatchEncoder::new(Arc::clone(&rollup_config), config);
+
+        let first = make_block(B256::ZERO);
+        let first_hash = first.header.hash_slow();
+        let second = make_block(first_hash);
+
+        encoder.add_block(first).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
+        assert!(encoder.ready_channels.is_empty());
+        assert_eq!(encoder.span_accumulator.len(), 1);
+
+        encoder.add_block(second).unwrap();
+        assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert!(encoder.span_accumulator.is_empty());
+        assert!(encoder.span_opened_at_l1.is_none());
+
+        let submission = encoder.next_submission().expect("submission should be available");
+        let channel_data = submission
+            .frames
+            .iter()
+            .flat_map(|frame| frame.data.iter().copied())
+            .collect::<Vec<_>>();
+        let mut reader = BatchReader::new(
+            channel_data,
+            RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize,
+            true,
+        );
+        let decoded = reader.next_batch(rollup_config.as_ref()).expect("decoded span batch");
+        let Batch::Span(span_batch) = decoded else {
+            panic!("expected span batch");
+        };
+
+        assert_eq!(span_batch.batches.len(), 2);
+        assert!(reader.next_batch(rollup_config.as_ref()).is_none());
     }
 
     /// Span batches encode their timestamp relative to the rollup genesis timestamp.
