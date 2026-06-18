@@ -568,10 +568,10 @@ mod tests {
                 .iter()
                 .map(|blob| BlobDecoder::decode(blob).expect("blob payload should decode"))
                 .collect();
-            self.candidates.lock().unwrap().push(RecordedCandidate {
-                tx_data: candidate.tx_data.clone(),
-                decoded_blob_payloads,
-            });
+            self.candidates
+                .lock()
+                .unwrap()
+                .push(RecordedCandidate { tx_data: candidate.tx_data, decoded_blob_payloads });
             let l1_block = self.l1_block;
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Ok(stub_receipt(l1_block)));

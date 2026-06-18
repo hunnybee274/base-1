@@ -1,7 +1,7 @@
 //! Parity normalization errors.
 
 use base_blobs::BlobDecodeError;
-use base_protocol::{BatchDecodingError, DecompressionError, FrameParseError};
+use base_protocol::{BatchDecodingError, BatchReaderError, DecompressionError, FrameParseError};
 
 /// Error returned while normalizing a batcher DA submission.
 #[derive(Debug, thiserror::Error)]
@@ -21,4 +21,14 @@ pub enum ParityError {
     /// A decompressed channel payload failed batch decoding.
     #[error("failed to decode batch: {0}")]
     BatchDecode(#[from] BatchDecodingError),
+}
+
+impl From<BatchReaderError> for ParityError {
+    fn from(error: BatchReaderError) -> Self {
+        match error {
+            BatchReaderError::Decompression(error) => Self::ChannelDecompress(error),
+            BatchReaderError::Rlp(error) => Self::ChannelRlp(error),
+            BatchReaderError::Batch(error) => Self::BatchDecode(error),
+        }
+    }
 }

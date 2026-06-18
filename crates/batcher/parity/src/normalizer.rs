@@ -4,7 +4,6 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use alloy_eips::eip4844::Blob;
 use alloy_primitives::keccak256;
-use alloy_rlp::Decodable;
 use base_blobs::BlobDecoder;
 use base_common_genesis::RollupConfig;
 use base_protocol::{Batch, BatchReader, BlockInfo, Channel, ChannelId, Frame};
@@ -67,24 +66,32 @@ impl ParityNormalizer {
         }
 
         let mut complete_channels = 0usize;
+        let mut ready_channels = 0usize;
+        let mut decode_errors = 0usize;
         let mut batches = Vec::new();
         for id in channel_order {
             let Some(channel) = channels.get(&id) else { continue };
             if !channel.is_ready() {
                 continue;
             }
-            complete_channels += 1;
-            batches.extend(
-                Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config)
-                    .unwrap_or_default(),
-            );
+            ready_channels += 1;
+            match Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config) {
+                Ok(decoded) => {
+                    complete_channels += 1;
+                    batches.extend(decoded);
+                }
+                Err(_) => {
+                    decode_errors += 1;
+                }
+            }
         }
 
         NormalizedSubmission {
             batches,
             complete_channels,
-            incomplete_channels: channels.len().saturating_sub(complete_channels),
+            incomplete_channels: channels.len().saturating_sub(ready_channels),
             rejected_frames,
+            decode_errors,
         }
     }
 
@@ -109,13 +116,7 @@ impl ParityNormalizer {
         let brotli_supported = rollup_config.is_fjord_active(inclusion_timestamp);
         let mut reader = BatchReader::new(data.to_vec(), max_rlp, brotli_supported);
         let mut batches = Vec::new();
-        reader.decompress()?;
-
-        while reader.cursor < reader.decompressed.len() {
-            let decompressed_reader = &mut reader.decompressed.as_slice()[reader.cursor..].as_ref();
-            let bytes = alloy_primitives::Bytes::decode(decompressed_reader)?;
-            let batch = Batch::decode(&mut bytes.as_ref(), rollup_config)?;
-            reader.cursor = reader.decompressed.len() - decompressed_reader.len();
+        while let Some(batch) = reader.next_batch_strict(rollup_config)? {
             batches.push(Self::normalize_batch(&batch));
         }
 
@@ -385,5 +386,19 @@ mod tests {
             .expect_err("corrupted channel must fail strict normalization");
 
         assert!(matches!(err, ParityError::ChannelDecompress(_)));
+    }
+
+    #[test]
+    fn normalize_frames_counts_decode_errors() {
+        let rollup_config = test_rollup_config();
+        let id = [1u8; Channel::ID_LENGTH];
+        let frames = vec![single_frame(id, vec![0x02])];
+
+        let normalized = ParityNormalizer::normalize_frames(frames, 0, &rollup_config);
+
+        assert_eq!(normalized.batches.len(), 0);
+        assert_eq!(normalized.complete_channels, 0);
+        assert_eq!(normalized.incomplete_channels, 0);
+        assert_eq!(normalized.decode_errors, 1);
     }
 }

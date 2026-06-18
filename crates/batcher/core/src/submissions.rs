@@ -17,29 +17,39 @@ use crate::TxOutcome;
 type InFlight =
     FuturesUnordered<Pin<Box<dyn Future<Output = (Vec<SubmissionId>, TxOutcome)> + Send>>>;
 
-fn blob_tx_candidate(
-    inbox: Address,
-    frames: &[Arc<Frame>],
-) -> Result<(TxCandidate, u64), BlobEncodeError> {
-    let mut blobs = Vec::with_capacity(frames.len());
-    let mut payload_size = 0usize;
+/// Builds L1 transaction candidates for batch submissions.
+#[derive(Debug)]
+pub struct BatchTxCandidateBuilder;
 
-    for frame in frames {
-        let data = FrameEncoder::to_calldata(frame);
-        payload_size += data.len();
-        blobs.push(BlobEncoder::encode(data.as_ref())?);
+impl BatchTxCandidateBuilder {
+    /// Build a blob transaction candidate from batch frames.
+    ///
+    /// Each frame is encoded as one Base blob payload and the returned byte
+    /// count is the total payload bytes submitted across all blobs.
+    pub fn blob_tx_candidate(
+        inbox: Address,
+        frames: &[Arc<Frame>],
+    ) -> Result<(TxCandidate, u64), BlobEncodeError> {
+        let mut blobs = Vec::with_capacity(frames.len());
+        let mut payload_size = 0usize;
+
+        for frame in frames {
+            let data = FrameEncoder::to_calldata(frame);
+            payload_size += data.len();
+            blobs.push(BlobEncoder::encode(data.as_ref())?);
+        }
+
+        Ok((
+            TxCandidate {
+                to: Some(inbox),
+                tx_data: Bytes::new(),
+                value: U256::ZERO,
+                gas_limit: 0,
+                blobs: Arc::from(blobs),
+            },
+            payload_size as u64,
+        ))
     }
-
-    Ok((
-        TxCandidate {
-            to: Some(inbox),
-            tx_data: Bytes::new(),
-            value: U256::ZERO,
-            gas_limit: 0,
-            blobs: Arc::from(blobs),
-        },
-        payload_size as u64,
-    ))
 }
 
 /// Manages the full submission lifecycle for the batch driver.
@@ -88,6 +98,13 @@ impl<TM: TxManager> SubmissionQueue<TM> {
                 drop(permit);
                 break;
             };
+            debug_assert!(!sub.frames.is_empty(), "batch submissions must contain frames");
+            if sub.frames.is_empty() {
+                warn!(submission = ?sub.id, "skipping empty batch submission");
+                BatcherMetrics::submission_total(BatcherMetrics::OUTCOME_FAILED).increment(1);
+                drop(permit);
+                continue;
+            }
 
             let da_type_label = match sub.da_type {
                 DaType::Blob => BatcherMetrics::DA_TYPE_BLOB,
@@ -95,18 +112,20 @@ impl<TM: TxManager> SubmissionQueue<TM> {
             };
             let blob_payload_bytes;
             let candidate = match sub.da_type {
-                DaType::Blob => match blob_tx_candidate(self.inbox, &sub.frames) {
-                    Ok((candidate, payload_size)) => {
-                        blob_payload_bytes = Some(payload_size);
-                        candidate
+                DaType::Blob => {
+                    match BatchTxCandidateBuilder::blob_tx_candidate(self.inbox, &sub.frames) {
+                        Ok((candidate, payload_size)) => {
+                            blob_payload_bytes = Some(payload_size);
+                            candidate
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to encode frames to blob, requeueing");
+                            pipeline.requeue(sub.id);
+                            drop(permit);
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "failed to encode frames to blob, requeueing");
-                        pipeline.requeue(sub.id);
-                        drop(permit);
-                        break;
-                    }
-                },
+                }
                 DaType::Calldata => {
                     blob_payload_bytes = None;
                     TxCandidate {

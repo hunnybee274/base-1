@@ -33,8 +33,8 @@ pub use safe_head_poller::{SafeHeadPoller, SafeHeadProvider};
 
 mod shadow_parity;
 pub use shadow_parity::{
-    IngestedPayload, ParityCompareStats, ParitySide, ParitySideState, ParityState,
-    ShadowParityMonitor, ShadowParityMonitorConfig,
+    IngestedPayload, PENDING_QUEUE_DRIFT_WARN_THRESHOLD, ParityCompareStats, ParitySide,
+    ParitySideState, ParityState, ShadowParityMonitor, ShadowParityMonitorConfig,
 };
 
 mod service;

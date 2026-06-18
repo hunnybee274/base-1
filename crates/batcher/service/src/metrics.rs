@@ -22,6 +22,8 @@ base_metrics::define_metrics! {
     canonical_pending_batches: gauge,
     #[describe("Shadow decoded batches waiting for a canonical comparison")]
     shadow_pending_batches: gauge,
+    #[describe("Absolute decoded-batch queue length difference between canonical and shadow")]
+    pending_batch_delta: gauge,
     #[describe("Total matching batch parity comparisons")]
     matches_total: counter,
     #[describe("Total diverging batch parity comparisons")]
@@ -40,6 +42,8 @@ base_metrics::define_metrics! {
     blob_fetch_errors_total: counter,
     #[describe("Total payload/frame/channel extraction errors seen by the shadow parity monitor")]
     extraction_errors_total: counter,
+    #[describe("Total incomplete channels evicted by the shadow parity monitor")]
+    evicted_channels_total: counter,
     #[describe("Total blob submissions skipped because no L1 beacon URL is configured")]
     missing_beacon_total: counter,
 }

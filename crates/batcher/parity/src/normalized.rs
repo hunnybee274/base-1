@@ -56,6 +56,8 @@ pub struct NormalizedSubmission {
     pub incomplete_channels: usize,
     /// Number of frames rejected while assembling channels.
     pub rejected_frames: usize,
+    /// Number of complete channels that failed strict batch decoding.
+    pub decode_errors: usize,
 }
 
 /// Summary comparison between two normalized submissions.

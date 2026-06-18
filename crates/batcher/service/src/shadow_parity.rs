@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    panic::AssertUnwindSafe,
     sync::Arc,
     time::Duration,
 };
@@ -15,11 +16,15 @@ use base_common_genesis::RollupConfig;
 use base_consensus_derive::BlobProvider;
 use base_consensus_providers::{BeaconClient, OnlineBeaconClient, OnlineBlobProvider};
 use base_protocol::{BlockInfo, Channel, ChannelId, Frame};
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::BatcherServiceMetrics;
+
+/// Pending-batch queue delta that triggers an operator-facing drift warning.
+pub const PENDING_QUEUE_DRIFT_WARN_THRESHOLD: usize = 10;
 
 /// Runtime configuration for the shadow parity monitor.
 #[derive(Debug, Clone)]
@@ -78,6 +83,8 @@ pub struct ParityState {
     pub shadow: ParitySideState,
     /// Last comparison result, if any comparison has completed.
     pub last_result: Option<bool>,
+    /// Last pending queue drift reported to logs.
+    pub last_reported_pending_drift: usize,
 }
 
 /// Channel assembler and decoded-batch queue for one side.
@@ -128,7 +135,12 @@ impl ShadowParityMonitor {
 
     /// Spawn the monitor as a background task.
     pub fn spawn(self, cancellation: CancellationToken) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(cancellation))
+        tokio::spawn(async move {
+            if AssertUnwindSafe(self.run(cancellation)).catch_unwind().await.is_err() {
+                BatcherServiceMetrics::enabled().set(0.0);
+                error!("shadow parity monitor panicked");
+            }
+        })
     }
 
     /// Run the monitor until cancellation.
@@ -236,8 +248,23 @@ impl ShadowParityMonitor {
             self.process_transaction(side, tx, &block_info).await;
         }
 
+        let evicted_channels = self.state.evict_expired_channels(
+            block_info.number,
+            block_info.timestamp,
+            &self.config.rollup_config,
+        );
+        if evicted_channels > 0 {
+            BatcherServiceMetrics::evicted_channels_total().increment(evicted_channels as u64);
+            debug!(
+                l1_block = %block_number,
+                evicted_channels = %evicted_channels,
+                "evicted stale shadow parity channels"
+            );
+        }
+
         let stats = self.state.compare_ready(block_number);
         self.state.record_pending_metrics();
+        self.state.warn_on_pending_drift(block_number);
         self.state.record_alignment_metric();
         BatcherServiceMetrics::latest_l1_block().set(block_number as f64);
 
@@ -408,6 +435,8 @@ pub struct IngestedPayload {
     pub complete_channels: usize,
     /// Number of decoded batches added to the comparison queue.
     pub batches: usize,
+    /// Number of complete channels that failed strict batch decoding.
+    pub decode_errors: usize,
 }
 
 impl ParityState {
@@ -430,6 +459,10 @@ impl ParityState {
     /// Compare all currently paired decoded batches.
     pub fn compare_ready(&mut self, l1_block: u64) -> ParityCompareStats {
         let mut stats = ParityCompareStats::default();
+        // Comparisons are intentionally positional: once one side emits an
+        // extra or missing batch, the pending queue delta below is the operator
+        // signal that later comparisons may be offset rather than independently
+        // divergent.
         while let (Some(canonical), Some(shadow)) =
             (self.canonical.batches.pop_front(), self.shadow.batches.pop_front())
         {
@@ -469,6 +502,43 @@ impl ParityState {
         BatcherServiceMetrics::canonical_pending_batches()
             .set(self.canonical.pending_batches() as f64);
         BatcherServiceMetrics::shadow_pending_batches().set(self.shadow.pending_batches() as f64);
+        BatcherServiceMetrics::pending_batch_delta().set(self.pending_batch_delta() as f64);
+    }
+
+    /// Warn when positional comparison queues are persistently drifting apart.
+    pub fn warn_on_pending_drift(&mut self, l1_block: u64) {
+        let drift = self.pending_batch_delta();
+        if drift < PENDING_QUEUE_DRIFT_WARN_THRESHOLD {
+            self.last_reported_pending_drift = 0;
+            return;
+        }
+        if drift == self.last_reported_pending_drift {
+            return;
+        }
+        self.last_reported_pending_drift = drift;
+        warn!(
+            l1_block = %l1_block,
+            drift = %drift,
+            canonical_pending = %self.canonical.pending_batches(),
+            shadow_pending = %self.shadow.pending_batches(),
+            "shadow parity pending queues drifted"
+        );
+    }
+
+    /// Return the absolute pending-batch queue delta between sides.
+    pub fn pending_batch_delta(&self) -> usize {
+        self.canonical.pending_batches().abs_diff(self.shadow.pending_batches())
+    }
+
+    /// Evict incomplete channels that have exceeded the rollup channel timeout.
+    pub fn evict_expired_channels(
+        &mut self,
+        l1_block: u64,
+        l1_timestamp: u64,
+        rollup_config: &RollupConfig,
+    ) -> usize {
+        self.canonical.evict_expired_channels(l1_block, l1_timestamp, rollup_config)
+            + self.shadow.evict_expired_channels(l1_block, l1_timestamp, rollup_config)
     }
 
     /// Record the alignment gauge.
@@ -501,7 +571,7 @@ impl ParitySideState {
         for frame in frames {
             self.ingest_frame(frame, block_info);
         }
-        self.drain_ready_channels(block_info.timestamp, rollup_config)
+        Ok(self.drain_ready_channels(block_info.timestamp, rollup_config))
     }
 
     /// Ingest one frame.
@@ -526,7 +596,7 @@ impl ParitySideState {
         &mut self,
         inclusion_timestamp: u64,
         rollup_config: &RollupConfig,
-    ) -> Result<IngestedPayload, ParityError> {
+    ) -> IngestedPayload {
         let ready_ids = self
             .channel_order
             .iter()
@@ -538,17 +608,59 @@ impl ParitySideState {
         for id in ready_ids {
             self.channel_order.retain(|queued| queued != &id);
             let Some(channel) = self.channels.remove(&id) else { continue };
-            let batches = ParityNormalizer::try_normalize_channel(
+            match ParityNormalizer::try_normalize_channel(
                 &channel,
                 inclusion_timestamp,
                 rollup_config,
-            )?;
-            result.complete_channels += 1;
-            result.batches += batches.len();
-            self.batches.extend(batches);
+            ) {
+                Ok(batches) => {
+                    result.complete_channels += 1;
+                    result.batches += batches.len();
+                    self.batches.extend(batches);
+                }
+                Err(e) => {
+                    result.decode_errors += 1;
+                    BatcherServiceMetrics::extraction_errors_total().increment(1);
+                    debug!(
+                        error = %e,
+                        channel = %alloy_primitives::hex::encode(id),
+                        "skipping corrupted channel during shadow parity drain"
+                    );
+                }
+            }
         }
 
-        Ok(result)
+        result
+    }
+
+    /// Evict incomplete channels that exceeded the rollup channel timeout.
+    pub fn evict_expired_channels(
+        &mut self,
+        l1_block: u64,
+        l1_timestamp: u64,
+        rollup_config: &RollupConfig,
+    ) -> usize {
+        let timeout = rollup_config.channel_timeout(l1_timestamp);
+        let expired = self
+            .channel_order
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.channels.get(id).is_some_and(|channel| {
+                    channel.open_block_number().saturating_add(timeout) < l1_block
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if expired.is_empty() {
+            return 0;
+        }
+
+        for id in &expired {
+            self.channels.remove(id);
+        }
+        self.channel_order.retain(|id| !expired.contains(id));
+        expired.len()
     }
 
     /// Number of decoded batches waiting for comparison.
@@ -559,9 +671,39 @@ impl ParitySideState {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::B256;
+    use alloy_eips::eip1898::BlockNumHash;
+    use alloy_primitives::{B256, Bytes};
+    use alloy_rlp::Encodable;
+    use base_common_genesis::{ChainGenesis, RollupConfig};
+    use base_protocol::{Batch, SingleBatch};
 
     use super::*;
+
+    fn test_rollup_config() -> RollupConfig {
+        RollupConfig {
+            genesis: ChainGenesis {
+                l2: BlockNumHash { number: 100, hash: B256::ZERO },
+                ..Default::default()
+            },
+            block_time: 2,
+            channel_timeout: 5,
+            ..Default::default()
+        }
+    }
+
+    fn encode_single_batch(batch: &SingleBatch) -> Vec<u8> {
+        let typed_batch = Batch::Single(batch.clone());
+        let mut batch_bytes = Vec::new();
+        typed_batch.encode(&mut batch_bytes).expect("batch must encode");
+
+        let mut rlp_buf = Vec::new();
+        batch_bytes.as_slice().encode(&mut rlp_buf);
+        miniz_oxide::deflate::compress_to_vec_zlib(&rlp_buf, 6)
+    }
+
+    fn single_frame(id: ChannelId, data: Vec<u8>) -> Frame {
+        Frame { id, number: 0, data, is_last: true }
+    }
 
     fn normalized_batch(timestamp: u64) -> NormalizedBatch {
         NormalizedBatch {
@@ -619,5 +761,66 @@ mod tests {
         state.canonical.batches.push_back(normalized_batch(102));
 
         assert_eq!(state.is_aligned(), Some(false));
+    }
+
+    #[test]
+    fn pending_batch_delta_reports_queue_drift() {
+        let mut state = ParityState::default();
+        state.canonical.batches.push_back(normalized_batch(100));
+        state.canonical.batches.push_back(normalized_batch(102));
+
+        assert_eq!(state.pending_batch_delta(), 2);
+    }
+
+    #[test]
+    fn drain_ready_channels_skips_corrupt_channel_and_continues() {
+        let rollup_config = test_rollup_config();
+        let mut state = ParitySideState::default();
+        let block_info = BlockInfo::default();
+        let corrupt_id = [1u8; Channel::ID_LENGTH];
+        let valid_id = [2u8; Channel::ID_LENGTH];
+        let batch = SingleBatch {
+            epoch_num: 123,
+            timestamp: 1000,
+            transactions: vec![Bytes::from_static(b"tx-a")],
+            ..Default::default()
+        };
+
+        state.ingest_frame(single_frame(corrupt_id, vec![0x02]), block_info);
+        state.ingest_frame(single_frame(valid_id, encode_single_batch(&batch)), block_info);
+
+        let ingested = state.drain_ready_channels(0, &rollup_config);
+
+        assert_eq!(ingested.complete_channels, 1);
+        assert_eq!(ingested.batches, 1);
+        assert_eq!(ingested.decode_errors, 1);
+        assert_eq!(state.pending_batches(), 1);
+        assert!(state.channels.is_empty());
+        assert!(state.channel_order.is_empty());
+    }
+
+    #[test]
+    fn evict_expired_channels_removes_stale_incomplete_channels() {
+        let rollup_config = test_rollup_config();
+        let mut state = ParitySideState::default();
+        let block_info = BlockInfo { number: 10, ..Default::default() };
+        let expired_id = [1u8; Channel::ID_LENGTH];
+        let live_id = [2u8; Channel::ID_LENGTH];
+
+        state.ingest_frame(
+            Frame { id: expired_id, number: 0, data: vec![0x01], is_last: false },
+            block_info,
+        );
+        state.ingest_frame(
+            Frame { id: live_id, number: 0, data: vec![0x01], is_last: false },
+            BlockInfo { number: 14, ..Default::default() },
+        );
+
+        let evicted = state.evict_expired_channels(16, 0, &rollup_config);
+
+        assert_eq!(evicted, 1);
+        assert!(!state.channels.contains_key(&expired_id));
+        assert!(state.channels.contains_key(&live_id));
+        assert_eq!(state.channel_order.iter().copied().collect::<Vec<_>>(), vec![live_id]);
     }
 }
