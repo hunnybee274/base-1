@@ -431,7 +431,9 @@ mod tests {
         time::Duration,
     };
 
-    use alloy_primitives::{Address, Bytes};
+    use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy_primitives::{Address, B256, Bloom, Bytes};
+    use alloy_rpc_types_eth::TransactionReceipt;
     use base_batcher_encoder::{BatchSubmission, DaType, FrameEncoder, SubmissionId};
     use base_blobs::{BlobDecoder, BlobEncoder};
     use base_protocol::{ChannelId, Frame};
@@ -470,6 +472,31 @@ mod tests {
                     })
                 })
                 .collect(),
+        }
+    }
+
+    const fn stub_receipt(block_number: u64) -> TransactionReceipt {
+        let inner = ReceiptEnvelope::Legacy(ReceiptWithBloom {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::ZERO,
+        });
+        TransactionReceipt {
+            inner,
+            transaction_hash: B256::ZERO,
+            transaction_index: Some(0),
+            block_hash: Some(B256::ZERO),
+            block_number: Some(block_number),
+            gas_used: 21_000,
+            effective_gas_price: 1_000_000_000,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
         }
     }
 
@@ -546,7 +573,9 @@ mod tests {
                 decoded_blob_payloads,
             });
             let l1_block = self.l1_block;
-            async move { ImmediateConfirmTxManager { l1_block }.send_async(candidate).await }
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Ok(stub_receipt(l1_block)));
+            std::future::ready(SendHandle::new(rx))
         }
 
         fn sender_address(&self) -> Address {
