@@ -1,7 +1,7 @@
 //! Shadow-mode batch inbox parity monitoring.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     panic::AssertUnwindSafe,
     sync::Arc,
     time::Duration,
@@ -10,7 +10,9 @@ use std::{
 use alloy_primitives::{Address, Bytes};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockNumberOrTag, Transaction, TransactionTrait};
-use base_batcher_parity::{NormalizedBatch, ParityComparator, ParityError, ParityNormalizer};
+use base_batcher_parity::{
+    NormalizedBatch, NormalizedL2Block, ParityComparator, ParityError, ParityNormalizer,
+};
 use base_blobs::BlobDecoder;
 use base_common_genesis::RollupConfig;
 use base_consensus_derive::BlobProvider;
@@ -72,6 +74,10 @@ pub struct ParityCompareStats {
     pub matches: usize,
     /// Number of diverging batches compared.
     pub divergences: usize,
+    /// Number of matching decoded L2 blocks compared by timestamp and content.
+    pub l2_block_matches: usize,
+    /// Number of diverging decoded L2 blocks compared by timestamp and content.
+    pub l2_block_mismatches: usize,
 }
 
 /// Stateful parity comparison data.
@@ -83,6 +89,8 @@ pub struct ParityState {
     pub shadow: ParitySideState,
     /// Last comparison result, if any comparison has completed.
     pub last_result: Option<bool>,
+    /// Last decoded L2 block content comparison result, if any has completed.
+    pub last_l2_result: Option<bool>,
     /// Last pending queue drift reported to logs.
     pub last_reported_pending_drift: usize,
 }
@@ -96,6 +104,8 @@ pub struct ParitySideState {
     pub channel_order: VecDeque<ChannelId>,
     /// Decoded batches waiting for the opposite side.
     pub batches: VecDeque<NormalizedBatch>,
+    /// Decoded L2 blocks waiting for the opposite side, keyed by L2 timestamp.
+    pub l2_blocks: BTreeMap<u64, VecDeque<NormalizedL2Block>>,
 }
 
 impl ShadowParityMonitor {
@@ -268,13 +278,21 @@ impl ShadowParityMonitor {
         self.state.record_alignment_metric();
         BatcherServiceMetrics::latest_l1_block().set(block_number as f64);
 
-        if stats.matches > 0 || stats.divergences > 0 {
+        if stats.matches > 0
+            || stats.divergences > 0
+            || stats.l2_block_matches > 0
+            || stats.l2_block_mismatches > 0
+        {
             debug!(
                 l1_block = %block_number,
                 matches = %stats.matches,
                 divergences = %stats.divergences,
+                l2_block_matches = %stats.l2_block_matches,
+                l2_block_mismatches = %stats.l2_block_mismatches,
                 canonical_pending = %self.state.canonical.pending_batches(),
                 shadow_pending = %self.state.shadow.pending_batches(),
+                canonical_l2_pending = %self.state.canonical.pending_l2_blocks(),
+                shadow_l2_pending = %self.state.shadow.pending_l2_blocks(),
                 "shadow parity comparisons processed"
             );
         }
@@ -380,6 +398,7 @@ impl ShadowParityMonitor {
                 if decoded.complete_channels > 0 {
                     side.increment_complete_channels(decoded.complete_channels as u64);
                     side.increment_batches(decoded.batches as u64);
+                    side.increment_l2_blocks(decoded.l2_blocks as u64);
                 }
             }
             Err(e) => {
@@ -426,6 +445,18 @@ impl ParitySide {
             }
         }
     }
+
+    /// Increment the decoded L2 block counter for this side.
+    pub fn increment_l2_blocks(self, count: u64) {
+        match self {
+            Self::Canonical => {
+                BatcherServiceMetrics::canonical_l2_blocks_total().increment(count);
+            }
+            Self::Shadow => {
+                BatcherServiceMetrics::shadow_l2_blocks_total().increment(count);
+            }
+        }
+    }
 }
 
 /// Result from ingesting one payload into a side state.
@@ -435,6 +466,8 @@ pub struct IngestedPayload {
     pub complete_channels: usize,
     /// Number of decoded batches added to the comparison queue.
     pub batches: usize,
+    /// Number of decoded L2 blocks added to the comparison queue.
+    pub l2_blocks: usize,
     /// Number of complete channels that failed strict batch decoding.
     pub decode_errors: usize,
 }
@@ -494,6 +527,81 @@ impl ParityState {
                 );
             }
         }
+        let l2_stats = self.compare_l2_blocks(l1_block);
+        stats.l2_block_matches = l2_stats.l2_block_matches;
+        stats.l2_block_mismatches = l2_stats.l2_block_mismatches;
+        stats
+    }
+
+    /// Compare decoded L2 blocks by timestamp and content, independent of submission order.
+    pub fn compare_l2_blocks(&mut self, l1_block: u64) -> ParityCompareStats {
+        let timestamps = self
+            .canonical
+            .l2_blocks
+            .keys()
+            .copied()
+            .filter(|timestamp| self.shadow.l2_blocks.contains_key(timestamp))
+            .collect::<Vec<_>>();
+        let mut stats = ParityCompareStats::default();
+
+        for timestamp in timestamps {
+            let pair_count = self
+                .canonical
+                .l2_blocks
+                .get(&timestamp)
+                .map_or(0, VecDeque::len)
+                .min(self.shadow.l2_blocks.get(&timestamp).map_or(0, VecDeque::len));
+
+            for _ in 0..pair_count {
+                let Some(canonical) = self.canonical.pop_l2_block(timestamp) else {
+                    continue;
+                };
+                let Some(shadow) = self.shadow.pop_l2_block(timestamp) else {
+                    self.canonical.push_l2_block(canonical);
+                    continue;
+                };
+
+                if canonical.content_matches(&shadow) {
+                    stats.l2_block_matches += 1;
+                    self.last_l2_result = Some(true);
+                    BatcherServiceMetrics::l2_block_matches_total().increment(1);
+                    if canonical.tx_count() > 0 {
+                        BatcherServiceMetrics::l2_block_non_empty_matches_total().increment(1);
+                    }
+                    BatcherServiceMetrics::last_l2_block_match_timestamp().set(timestamp as f64);
+                    BatcherServiceMetrics::last_l2_block_match_l1_block().set(l1_block as f64);
+                } else {
+                    stats.l2_block_mismatches += 1;
+                    self.last_l2_result = Some(false);
+                    BatcherServiceMetrics::l2_block_mismatches_total().increment(1);
+                    BatcherServiceMetrics::last_l2_block_mismatch_timestamp().set(timestamp as f64);
+                    BatcherServiceMetrics::last_l2_block_mismatch_l1_block().set(l1_block as f64);
+
+                    let reason = if canonical.epoch_num != shadow.epoch_num {
+                        BatcherServiceMetrics::l2_block_origin_mismatches_total().increment(1);
+                        "origin"
+                    } else if canonical.tx_count() != shadow.tx_count() {
+                        BatcherServiceMetrics::l2_block_tx_count_mismatches_total().increment(1);
+                        "tx_count"
+                    } else {
+                        BatcherServiceMetrics::l2_block_tx_hash_mismatches_total().increment(1);
+                        "tx_hash"
+                    };
+
+                    warn!(
+                        l1_block = %l1_block,
+                        l2_timestamp = %timestamp,
+                        canonical_epoch = %canonical.epoch_num,
+                        shadow_epoch = %shadow.epoch_num,
+                        canonical_tx_count = %canonical.tx_count(),
+                        shadow_tx_count = %shadow.tx_count(),
+                        reason,
+                        "shadow parity L2 block content divergence detected"
+                    );
+                }
+            }
+        }
+
         stats
     }
 
@@ -503,6 +611,15 @@ impl ParityState {
             .set(self.canonical.pending_batches() as f64);
         BatcherServiceMetrics::shadow_pending_batches().set(self.shadow.pending_batches() as f64);
         BatcherServiceMetrics::pending_batch_delta().set(self.pending_batch_delta() as f64);
+        BatcherServiceMetrics::canonical_pending_l2_blocks()
+            .set(self.canonical.pending_l2_blocks() as f64);
+        BatcherServiceMetrics::shadow_pending_l2_blocks()
+            .set(self.shadow.pending_l2_blocks() as f64);
+        BatcherServiceMetrics::pending_l2_block_delta().set(self.pending_l2_block_delta() as f64);
+        BatcherServiceMetrics::oldest_unmatched_canonical_l2_timestamp()
+            .set(self.canonical.oldest_l2_timestamp().unwrap_or_default() as f64);
+        BatcherServiceMetrics::oldest_unmatched_shadow_l2_timestamp()
+            .set(self.shadow.oldest_l2_timestamp().unwrap_or_default() as f64);
     }
 
     /// Warn when positional comparison queues are persistently drifting apart.
@@ -530,6 +647,11 @@ impl ParityState {
         self.canonical.pending_batches().abs_diff(self.shadow.pending_batches())
     }
 
+    /// Return the absolute pending decoded L2 block delta between sides.
+    pub fn pending_l2_block_delta(&self) -> usize {
+        self.canonical.pending_l2_blocks().abs_diff(self.shadow.pending_l2_blocks())
+    }
+
     /// Evict incomplete channels that have exceeded the rollup channel timeout.
     pub fn evict_expired_channels(
         &mut self,
@@ -550,6 +672,13 @@ impl ParityState {
 
     /// Return the current alignment state, if at least one comparison has completed.
     pub fn is_aligned(&self) -> Option<bool> {
+        if let Some(last_l2_result) = self.last_l2_result {
+            return Some(
+                last_l2_result
+                    && self.canonical.pending_l2_blocks() == 0
+                    && self.shadow.pending_l2_blocks() == 0,
+            );
+        }
         let last_result = self.last_result?;
         Some(
             last_result
@@ -615,8 +744,12 @@ impl ParitySideState {
             ) {
                 Ok(batches) => {
                     result.complete_channels += 1;
-                    result.batches += batches.len();
-                    self.batches.extend(batches);
+                    result.batches += batches.batches.len();
+                    result.l2_blocks += batches.l2_blocks.len();
+                    self.batches.extend(batches.batches);
+                    for block in batches.l2_blocks {
+                        self.push_l2_block(block);
+                    }
                 }
                 Err(e) => {
                     result.decode_errors += 1;
@@ -666,6 +799,30 @@ impl ParitySideState {
     /// Number of decoded batches waiting for comparison.
     pub fn pending_batches(&self) -> usize {
         self.batches.len()
+    }
+
+    /// Number of decoded L2 blocks waiting for content comparison.
+    pub fn pending_l2_blocks(&self) -> usize {
+        self.l2_blocks.values().map(VecDeque::len).sum()
+    }
+
+    /// Oldest decoded L2 block timestamp waiting for content comparison.
+    pub fn oldest_l2_timestamp(&self) -> Option<u64> {
+        self.l2_blocks.keys().next().copied()
+    }
+
+    /// Store one decoded L2 block for future content comparison.
+    pub fn push_l2_block(&mut self, block: NormalizedL2Block) {
+        self.l2_blocks.entry(block.timestamp).or_default().push_back(block);
+    }
+
+    /// Pop the oldest decoded L2 block for a timestamp.
+    pub fn pop_l2_block(&mut self, timestamp: u64) -> Option<NormalizedL2Block> {
+        let block = self.l2_blocks.get_mut(&timestamp)?.pop_front();
+        if self.l2_blocks.get(&timestamp).is_some_and(VecDeque::is_empty) {
+            self.l2_blocks.remove(&timestamp);
+        }
+        block
     }
 }
 
@@ -724,6 +881,18 @@ mod tests {
         }
     }
 
+    fn normalized_l2_block(
+        timestamp: u64,
+        epoch_num: u64,
+        txs: &[&'static [u8]],
+    ) -> NormalizedL2Block {
+        NormalizedL2Block {
+            timestamp,
+            epoch_num,
+            tx_hashes: txs.iter().map(|tx| alloy_primitives::keccak256(*tx)).collect(),
+        }
+    }
+
     #[test]
     fn compare_ready_records_match() {
         let mut state = ParityState::default();
@@ -773,6 +942,74 @@ mod tests {
     }
 
     #[test]
+    fn compare_ready_matches_l2_blocks_independent_of_batch_position() {
+        let mut state = ParityState::default();
+        state.shadow.push_l2_block(normalized_l2_block(98, 9, &[b"shadow-extra"]));
+        state.canonical.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+        state.shadow.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+
+        let stats = state.compare_ready(50);
+
+        assert_eq!(stats.l2_block_matches, 1);
+        assert_eq!(stats.l2_block_mismatches, 0);
+        assert_eq!(state.canonical.pending_l2_blocks(), 0);
+        assert_eq!(state.shadow.pending_l2_blocks(), 1);
+        assert_eq!(state.shadow.oldest_l2_timestamp(), Some(98));
+        assert_eq!(state.is_aligned(), Some(false));
+    }
+
+    #[test]
+    fn compare_ready_records_l2_origin_mismatch() {
+        let mut state = ParityState::default();
+        state.canonical.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+        state.shadow.push_l2_block(normalized_l2_block(100, 11, &[b"tx-a"]));
+
+        let stats = state.compare_ready(50);
+
+        assert_eq!(stats.l2_block_matches, 0);
+        assert_eq!(stats.l2_block_mismatches, 1);
+        assert_eq!(state.canonical.pending_l2_blocks(), 0);
+        assert_eq!(state.shadow.pending_l2_blocks(), 0);
+        assert_eq!(state.is_aligned(), Some(false));
+    }
+
+    #[test]
+    fn compare_ready_records_l2_tx_count_mismatch() {
+        let mut state = ParityState::default();
+        state.canonical.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+        state.shadow.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a", b"tx-b"]));
+
+        let stats = state.compare_ready(50);
+
+        assert_eq!(stats.l2_block_matches, 0);
+        assert_eq!(stats.l2_block_mismatches, 1);
+        assert_eq!(state.is_aligned(), Some(false));
+    }
+
+    #[test]
+    fn compare_ready_records_l2_tx_hash_mismatch() {
+        let mut state = ParityState::default();
+        state.canonical.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+        state.shadow.push_l2_block(normalized_l2_block(100, 10, &[b"tx-b"]));
+
+        let stats = state.compare_ready(50);
+
+        assert_eq!(stats.l2_block_matches, 0);
+        assert_eq!(stats.l2_block_mismatches, 1);
+        assert_eq!(state.is_aligned(), Some(false));
+    }
+
+    #[test]
+    fn pending_l2_blocks_counts_duplicate_timestamps() {
+        let mut state = ParitySideState::default();
+        state.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+        state.push_l2_block(normalized_l2_block(100, 10, &[b"tx-a"]));
+
+        assert_eq!(state.pending_l2_blocks(), 2);
+        assert_eq!(state.oldest_l2_timestamp(), Some(100));
+    }
+
+    #[test]
     fn drain_ready_channels_skips_corrupt_channel_and_continues() {
         let rollup_config = test_rollup_config();
         let mut state = ParitySideState::default();
@@ -793,8 +1030,10 @@ mod tests {
 
         assert_eq!(ingested.complete_channels, 1);
         assert_eq!(ingested.batches, 1);
+        assert_eq!(ingested.l2_blocks, 1);
         assert_eq!(ingested.decode_errors, 1);
         assert_eq!(state.pending_batches(), 1);
+        assert_eq!(state.pending_l2_blocks(), 1);
         assert!(state.channels.is_empty());
         assert!(state.channel_order.is_empty());
     }

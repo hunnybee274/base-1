@@ -9,7 +9,8 @@ use base_common_genesis::RollupConfig;
 use base_protocol::{Batch, BatchReader, BlockInfo, Channel, ChannelId, Frame};
 
 use crate::{
-    NormalizedBatch, NormalizedBatchKind, NormalizedSubmission, ParityComparison, ParityError,
+    NormalizedBatch, NormalizedBatchKind, NormalizedChannel, NormalizedL2Block,
+    NormalizedSubmission, ParityComparison, ParityError,
 };
 
 /// Normalizes batcher DA submissions for stable parity comparison.
@@ -69,6 +70,7 @@ impl ParityNormalizer {
         let mut ready_channels = 0usize;
         let mut decode_errors = 0usize;
         let mut batches = Vec::new();
+        let mut l2_blocks = Vec::new();
         for id in channel_order {
             let Some(channel) = channels.get(&id) else { continue };
             if !channel.is_ready() {
@@ -78,7 +80,8 @@ impl ParityNormalizer {
             match Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config) {
                 Ok(decoded) => {
                     complete_channels += 1;
-                    batches.extend(decoded);
+                    batches.extend(decoded.batches);
+                    l2_blocks.extend(decoded.l2_blocks);
                 }
                 Err(_) => {
                     decode_errors += 1;
@@ -88,6 +91,7 @@ impl ParityNormalizer {
 
         NormalizedSubmission {
             batches,
+            l2_blocks,
             complete_channels,
             incomplete_channels: channels.len().saturating_sub(ready_channels),
             rejected_frames,
@@ -101,7 +105,9 @@ impl ParityNormalizer {
         inclusion_timestamp: u64,
         rollup_config: &RollupConfig,
     ) -> Vec<NormalizedBatch> {
-        Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config).unwrap_or_default()
+        Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config)
+            .map(|channel| channel.batches)
+            .unwrap_or_default()
     }
 
     /// Normalize all batches from a complete channel, preserving decode failures.
@@ -109,18 +115,22 @@ impl ParityNormalizer {
         channel: &Channel,
         inclusion_timestamp: u64,
         rollup_config: &RollupConfig,
-    ) -> Result<Vec<NormalizedBatch>, ParityError> {
-        let Some(data) = channel.frame_data() else { return Ok(Vec::new()) };
+    ) -> Result<NormalizedChannel, ParityError> {
+        let Some(data) = channel.frame_data() else {
+            return Ok(NormalizedChannel { batches: Vec::new(), l2_blocks: Vec::new() });
+        };
         let max_rlp = usize::try_from(rollup_config.max_rlp_bytes_per_channel(inclusion_timestamp))
             .expect("max RLP bytes per channel must fit in usize");
         let brotli_supported = rollup_config.is_fjord_active(inclusion_timestamp);
         let mut reader = BatchReader::new(data.to_vec(), max_rlp, brotli_supported);
         let mut batches = Vec::new();
+        let mut l2_blocks = Vec::new();
         while let Some(batch) = reader.next_batch_strict(rollup_config)? {
+            l2_blocks.extend(Self::normalize_l2_blocks(&batch));
             batches.push(Self::normalize_batch(&batch));
         }
 
-        Ok(batches)
+        Ok(NormalizedChannel { batches, l2_blocks })
     }
 
     /// Normalize a decoded batch.
@@ -173,6 +183,26 @@ impl ParityNormalizer {
             }
         }
     }
+
+    /// Normalize decoded L2 blocks from a batch.
+    pub fn normalize_l2_blocks(batch: &Batch) -> Vec<NormalizedL2Block> {
+        match batch {
+            Batch::Single(batch) => vec![NormalizedL2Block {
+                timestamp: batch.timestamp,
+                epoch_num: batch.epoch_num,
+                tx_hashes: batch.transactions.iter().map(|tx| keccak256(tx.as_ref())).collect(),
+            }],
+            Batch::Span(batch) => batch
+                .batches
+                .iter()
+                .map(|batch| NormalizedL2Block {
+                    timestamp: batch.timestamp,
+                    epoch_num: batch.epoch_num,
+                    tx_hashes: batch.transactions.iter().map(|tx| keccak256(tx.as_ref())).collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Compares normalized batcher submissions.
@@ -205,7 +235,9 @@ mod tests {
     use alloy_rlp::Encodable;
     use base_blobs::BlobEncoder;
     use base_common_genesis::{ChainGenesis, RollupConfig};
-    use base_protocol::{Batch, BlockInfo, Channel, Frame, SingleBatch};
+    use base_protocol::{
+        Batch, BlockInfo, Channel, Frame, SingleBatch, SpanBatch, SpanBatchElement,
+    };
 
     use super::*;
 
@@ -265,6 +297,7 @@ mod tests {
             .expect("right should normalize");
 
         assert_eq!(left.batches, right.batches);
+        assert_eq!(left.l2_blocks, right.l2_blocks);
         assert!(ParityComparator::compare(&left.batches, &right.batches).is_match);
     }
 
@@ -353,8 +386,11 @@ mod tests {
         let normalized = ParityNormalizer::normalize_frames(frames, 0, &rollup_config);
 
         assert_eq!(normalized.batches.len(), 2);
+        assert_eq!(normalized.l2_blocks.len(), 2);
         assert_eq!(normalized.batches[0].start_timestamp, 1000);
         assert_eq!(normalized.batches[1].start_timestamp, 1002);
+        assert_eq!(normalized.l2_blocks[0].timestamp, 1000);
+        assert_eq!(normalized.l2_blocks[1].timestamp, 1002);
     }
 
     #[test]
@@ -368,6 +404,7 @@ mod tests {
             .expect("blob should normalize");
 
         assert_eq!(normalized.batches.len(), 1);
+        assert_eq!(normalized.l2_blocks.len(), 1);
         assert_eq!(normalized.complete_channels, 1);
         assert_eq!(normalized.incomplete_channels, 0);
     }
@@ -397,8 +434,34 @@ mod tests {
         let normalized = ParityNormalizer::normalize_frames(frames, 0, &rollup_config);
 
         assert_eq!(normalized.batches.len(), 0);
+        assert_eq!(normalized.l2_blocks.len(), 0);
         assert_eq!(normalized.complete_channels, 0);
         assert_eq!(normalized.incomplete_channels, 0);
         assert_eq!(normalized.decode_errors, 1);
+    }
+
+    #[test]
+    fn normalizes_l2_blocks_from_span_batch_elements() {
+        let first = SpanBatchElement {
+            epoch_num: 123,
+            timestamp: 1000,
+            transactions: vec![Bytes::from_static(b"tx-a")],
+        };
+        let second = SpanBatchElement {
+            epoch_num: 124,
+            timestamp: 1002,
+            transactions: vec![Bytes::from_static(b"tx-b"), Bytes::from_static(b"tx-c")],
+        };
+        let batch = Batch::Span(SpanBatch { batches: vec![first, second], ..Default::default() });
+
+        let blocks = ParityNormalizer::normalize_l2_blocks(&batch);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].timestamp, 1000);
+        assert_eq!(blocks[0].epoch_num, 123);
+        assert_eq!(blocks[0].tx_count(), 1);
+        assert_eq!(blocks[1].timestamp, 1002);
+        assert_eq!(blocks[1].epoch_num, 124);
+        assert_eq!(blocks[1].tx_count(), 2);
     }
 }

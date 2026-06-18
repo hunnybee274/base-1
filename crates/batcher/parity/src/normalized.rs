@@ -45,11 +45,38 @@ pub struct NormalizedBatch {
     pub tx_hashes: Vec<B256>,
 }
 
+/// Stable L2 block-level summary used for order-independent parity comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedL2Block {
+    /// L2 block timestamp.
+    pub timestamp: u64,
+    /// L1 origin number for this L2 block.
+    pub epoch_num: u64,
+    /// Keccak256 hash of each encoded L2 transaction, in derived block order.
+    pub tx_hashes: Vec<B256>,
+}
+
+impl NormalizedL2Block {
+    /// Returns true when two decoded L2 block records contain the same batch data.
+    pub fn content_matches(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+            && self.epoch_num == other.epoch_num
+            && self.tx_hashes == other.tx_hashes
+    }
+
+    /// Number of L2 transactions encoded for this block.
+    pub fn tx_count(&self) -> usize {
+        self.tx_hashes.len()
+    }
+}
+
 /// Normalized view of one submitted DA payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedSubmission {
     /// Decoded batches.
     pub batches: Vec<NormalizedBatch>,
+    /// Decoded L2 blocks.
+    pub l2_blocks: Vec<NormalizedL2Block>,
     /// Number of complete channels decoded from the submission.
     pub complete_channels: usize,
     /// Number of incomplete channels left after ingesting all frames.
@@ -58,6 +85,15 @@ pub struct NormalizedSubmission {
     pub rejected_frames: usize,
     /// Number of complete channels that failed strict batch decoding.
     pub decode_errors: usize,
+}
+
+/// Normalized view of one complete channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedChannel {
+    /// Decoded batches.
+    pub batches: Vec<NormalizedBatch>,
+    /// Decoded L2 blocks.
+    pub l2_blocks: Vec<NormalizedL2Block>,
 }
 
 /// Summary comparison between two normalized submissions.

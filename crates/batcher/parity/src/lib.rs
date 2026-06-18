@@ -12,7 +12,8 @@ pub use error::ParityError;
 
 mod normalized;
 pub use normalized::{
-    NormalizedBatch, NormalizedBatchKind, NormalizedSubmission, ParityComparison,
+    NormalizedBatch, NormalizedBatchKind, NormalizedChannel, NormalizedL2Block,
+    NormalizedSubmission, ParityComparison,
 };
 
 mod normalizer;
