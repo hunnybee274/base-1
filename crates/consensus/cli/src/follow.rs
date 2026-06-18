@@ -54,11 +54,21 @@ impl ConsensusFollowNodeCommand {
             CliMetrics::init_rollup_config(&cfg);
         }
 
-        let rt = RuntimeManager::new().tokio_runtime()?;
-        rt.block_on(async move {
+        let manager = RuntimeManager::new();
+        let rt = manager.tokio_runtime()?;
+        rt.block_on(async {
             LogConfig::from(self.logging.clone())
-                .init_with_trace_args(&mut self.traces, &["libp2p_gossipsub=error"])?;
-            args.start().await
+                .init_with_trace_args(&mut self.traces, &["libp2p_gossipsub=error"])
+        })?;
+        rt.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!(target: "cli", "Received Ctrl-C, shutting down...");
+                    Ok(())
+                }
+                res = args.start() => res,
+            }
         })
     }
 }
