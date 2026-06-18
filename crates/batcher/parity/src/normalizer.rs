@@ -4,6 +4,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use alloy_eips::eip4844::Blob;
 use alloy_primitives::keccak256;
+use alloy_rlp::Decodable;
 use base_blobs::BlobDecoder;
 use base_common_genesis::RollupConfig;
 use base_protocol::{Batch, BatchReader, BlockInfo, Channel, ChannelId, Frame};
@@ -73,7 +74,10 @@ impl ParityNormalizer {
                 continue;
             }
             complete_channels += 1;
-            batches.extend(Self::normalize_channel(channel, inclusion_timestamp, rollup_config));
+            batches.extend(
+                Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config)
+                    .unwrap_or_default(),
+            );
         }
 
         NormalizedSubmission {
@@ -90,18 +94,32 @@ impl ParityNormalizer {
         inclusion_timestamp: u64,
         rollup_config: &RollupConfig,
     ) -> Vec<NormalizedBatch> {
-        let Some(data) = channel.frame_data() else { return Vec::new() };
+        Self::try_normalize_channel(channel, inclusion_timestamp, rollup_config).unwrap_or_default()
+    }
+
+    /// Normalize all batches from a complete channel, preserving decode failures.
+    pub fn try_normalize_channel(
+        channel: &Channel,
+        inclusion_timestamp: u64,
+        rollup_config: &RollupConfig,
+    ) -> Result<Vec<NormalizedBatch>, ParityError> {
+        let Some(data) = channel.frame_data() else { return Ok(Vec::new()) };
         let max_rlp = usize::try_from(rollup_config.max_rlp_bytes_per_channel(inclusion_timestamp))
             .expect("max RLP bytes per channel must fit in usize");
         let brotli_supported = rollup_config.is_fjord_active(inclusion_timestamp);
         let mut reader = BatchReader::new(data.to_vec(), max_rlp, brotli_supported);
         let mut batches = Vec::new();
+        reader.decompress()?;
 
-        while let Some(batch) = reader.next_batch(rollup_config) {
+        while reader.cursor < reader.decompressed.len() {
+            let decompressed_reader = &mut reader.decompressed.as_slice()[reader.cursor..].as_ref();
+            let bytes = alloy_primitives::Bytes::decode(decompressed_reader)?;
+            let batch = Batch::decode(&mut bytes.as_ref(), rollup_config)?;
+            reader.cursor = reader.decompressed.len() - decompressed_reader.len();
             batches.push(Self::normalize_batch(&batch));
         }
 
-        batches
+        Ok(batches)
     }
 
     /// Normalize a decoded batch.
@@ -109,6 +127,12 @@ impl ParityNormalizer {
         match batch {
             Batch::Single(batch) => NormalizedBatch {
                 kind: NormalizedBatchKind::Single,
+                parent_hash: Some(batch.parent_hash),
+                epoch_hash: Some(batch.epoch_hash),
+                parent_check: None,
+                l1_origin_check: None,
+                chain_id: None,
+                origin_bits: None,
                 start_timestamp: batch.timestamp,
                 end_timestamp: batch.timestamp,
                 start_epoch_num: batch.epoch_num,
@@ -122,6 +146,12 @@ impl ParityNormalizer {
                 let end = batch.batches.last();
                 NormalizedBatch {
                     kind: NormalizedBatchKind::Span,
+                    parent_hash: None,
+                    epoch_hash: None,
+                    parent_check: Some(batch.parent_check),
+                    l1_origin_check: Some(batch.l1_origin_check),
+                    chain_id: Some(batch.chain_id),
+                    origin_bits: Some(batch.origin_bits.as_ref().to_vec()),
                     start_timestamp: start.map_or(0, |batch| batch.timestamp),
                     end_timestamp: end.map_or(0, |batch| batch.timestamp),
                     start_epoch_num: start.map_or(0, |batch| batch.epoch_num),
@@ -174,7 +204,7 @@ mod tests {
     use alloy_rlp::Encodable;
     use base_blobs::BlobEncoder;
     use base_common_genesis::{ChainGenesis, RollupConfig};
-    use base_protocol::{Batch, Channel, Frame, SingleBatch};
+    use base_protocol::{Batch, BlockInfo, Channel, Frame, SingleBatch};
 
     use super::*;
 
@@ -273,6 +303,43 @@ mod tests {
     }
 
     #[test]
+    fn comparison_reports_parent_hash_mismatch() {
+        let rollup_config = test_rollup_config();
+        let left_batch = SingleBatch {
+            parent_hash: B256::repeat_byte(0x11),
+            epoch_num: 123,
+            timestamp: 1000,
+            transactions: vec![Bytes::from_static(b"tx-a")],
+            ..Default::default()
+        };
+        let right_batch = SingleBatch {
+            parent_hash: B256::repeat_byte(0x22),
+            epoch_num: 123,
+            timestamp: 1000,
+            transactions: vec![Bytes::from_static(b"tx-a")],
+            ..Default::default()
+        };
+
+        let left = calldata_from_frame(&single_frame(
+            [1u8; Channel::ID_LENGTH],
+            encode_single_batch(&left_batch),
+        ));
+        let right = calldata_from_frame(&single_frame(
+            [1u8; Channel::ID_LENGTH],
+            encode_single_batch(&right_batch),
+        ));
+
+        let left = ParityNormalizer::normalize_calldata(&left, 0, &rollup_config)
+            .expect("left should normalize");
+        let right = ParityNormalizer::normalize_calldata(&right, 0, &rollup_config)
+            .expect("right should normalize");
+        let comparison = ParityComparator::compare(&left.batches, &right.batches);
+
+        assert!(!comparison.is_match);
+        assert_eq!(comparison.first_mismatch, Some(0));
+    }
+
+    #[test]
     fn normalize_frames_preserves_first_seen_channel_order() {
         let rollup_config = test_rollup_config();
         let first_batch = SingleBatch { epoch_num: 123, timestamp: 1000, ..Default::default() };
@@ -302,5 +369,21 @@ mod tests {
         assert_eq!(normalized.batches.len(), 1);
         assert_eq!(normalized.complete_channels, 1);
         assert_eq!(normalized.incomplete_channels, 0);
+    }
+
+    #[test]
+    fn try_normalize_channel_reports_corrupted_channel_data() {
+        let rollup_config = test_rollup_config();
+        let block_info = BlockInfo::default();
+        let id = [1u8; Channel::ID_LENGTH];
+        let mut channel = Channel::new(id, block_info);
+        channel
+            .add_frame(single_frame(id, vec![0x02]), block_info)
+            .expect("frame should be accepted");
+
+        let err = ParityNormalizer::try_normalize_channel(&channel, 0, &rollup_config)
+            .expect_err("corrupted channel must fail strict normalization");
+
+        assert!(matches!(err, ParityError::ChannelDecompress(_)));
     }
 }

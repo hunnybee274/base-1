@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 base-blobs.workspace = true
+alloy-rlp.workspace = true
 base-common-genesis = { workspace = true, features = ["std"] }
 base-protocol = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
@@ -21,5 +22,4 @@ alloy-eips = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-alloy-rlp.workspace = true
 miniz_oxide.workspace = true

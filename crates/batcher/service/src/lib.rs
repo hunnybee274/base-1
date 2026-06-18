@@ -10,6 +10,9 @@
 mod config;
 pub use config::BatcherConfig;
 
+mod metrics;
+pub use metrics::BatcherServiceMetrics;
+
 mod recent_txs;
 pub use recent_txs::{MAX_CHECK_RECENT_TXS_DEPTH, RecentTxScanner, SCAN_FETCH_CONCURRENCY};
 
@@ -27,6 +30,12 @@ pub use throttle::RpcThrottleClient;
 
 mod safe_head_poller;
 pub use safe_head_poller::{SafeHeadPoller, SafeHeadProvider};
+
+mod shadow_parity;
+pub use shadow_parity::{
+    IngestedPayload, ParityCompareStats, ParitySide, ParitySideState, ParityState,
+    ShadowParityMonitor, ShadowParityMonitorConfig,
+};
 
 mod service;
 pub use service::{BatcherService, ReadyBatcher};

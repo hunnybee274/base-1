@@ -25,7 +25,7 @@ use url::Url;
 use crate::{
     BatcherConfig, MAX_CHECK_RECENT_TXS_DEPTH, NullL1HeadSubscription, NullSubscription,
     RecentTxScanner, RpcL1HeadPollingSource, RpcPollingSource, RpcThrottleClient, SafeHeadPoller,
-    WsBlockSubscription, WsL1HeadSubscription,
+    ShadowParityMonitor, ShadowParityMonitorConfig, WsBlockSubscription, WsL1HeadSubscription,
 };
 
 /// Service-internal throttle client variant: either a no-op or an RPC client.
@@ -512,6 +512,29 @@ impl BatcherService {
                 }
             })
             .await?;
+
+        if let Some(shadow_inbox) = self.config.batch_inbox_override {
+            if shadow_inbox == rollup_config.batch_inbox_address {
+                warn!(
+                    inbox = %shadow_inbox,
+                    "shadow parity monitor disabled because shadow inbox matches canonical inbox"
+                );
+            } else {
+                let monitor = ShadowParityMonitor::new(
+                    l1_provider.clone(),
+                    ShadowParityMonitorConfig {
+                        canonical_inbox: rollup_config.batch_inbox_address,
+                        shadow_inbox,
+                        poll_interval: self.config.poll_interval,
+                        start_depth: self.config.check_recent_txs_depth,
+                        rollup_config: Arc::clone(&rollup_config),
+                        l1_beacon_url: self.config.l1_beacon_url.clone(),
+                    },
+                )
+                .await?;
+                monitor.spawn(runtime.token().clone());
+            }
+        }
 
         // Optionally scan recent L1 blocks to find the highest L2 block already
         // submitted but not yet reflected in the safe head, preventing re-submissions

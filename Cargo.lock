@@ -3334,21 +3334,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "base-batcher-parity-bin"
-version = "0.0.0"
-dependencies = [
- "alloy-eips 2.0.5",
- "alloy-primitives",
- "base-batcher-parity",
- "base-common-chains",
- "base-common-genesis",
- "clap",
- "eyre",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "base-batcher-service"
 version = "0.0.0"
 dependencies = [
@@ -3361,11 +3346,16 @@ dependencies = [
  "base-batcher-admin",
  "base-batcher-core",
  "base-batcher-encoder",
+ "base-batcher-parity",
  "base-batcher-source",
+ "base-blobs",
  "base-common-consensus",
  "base-common-genesis",
  "base-common-network",
+ "base-consensus-derive",
+ "base-consensus-providers",
  "base-consensus-rpc",
+ "base-metrics",
  "base-protocol",
  "base-runtime",
  "base-tx-manager",
@@ -3374,6 +3364,7 @@ dependencies = [
  "futures",
  "httpmock",
  "jsonrpsee",
+ "metrics",
  "miniz_oxide 0.9.1",
  "tokio",
  "tokio-util",

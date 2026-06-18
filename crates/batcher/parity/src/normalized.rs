@@ -1,6 +1,6 @@
 //! Normalized batcher submission data.
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, FixedBytes};
 use serde::{Deserialize, Serialize};
 
 /// Batch kind after channel and frame metadata have been stripped.
@@ -17,6 +17,18 @@ pub enum NormalizedBatchKind {
 pub struct NormalizedBatch {
     /// Decoded batch kind.
     pub kind: NormalizedBatchKind,
+    /// Single-batch parent hash, if this is a single batch.
+    pub parent_hash: Option<B256>,
+    /// Single-batch L1 origin hash, if this is a single batch.
+    pub epoch_hash: Option<B256>,
+    /// Span-batch parent hash prefix, if this is a span batch.
+    pub parent_check: Option<FixedBytes<20>>,
+    /// Span-batch L1 origin hash prefix, if this is a span batch.
+    pub l1_origin_check: Option<FixedBytes<20>>,
+    /// Span-batch chain ID, if this is a span batch.
+    pub chain_id: Option<u64>,
+    /// Span-batch L1 origin transition bitfield, if this is a span batch.
+    pub origin_bits: Option<Vec<u8>>,
     /// First L2 timestamp covered by this decoded batch.
     pub start_timestamp: u64,
     /// Last L2 timestamp covered by this decoded batch.
