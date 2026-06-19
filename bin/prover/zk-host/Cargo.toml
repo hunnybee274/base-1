@@ -22,14 +22,6 @@ base-proof-zk-host.workspace = true
 base-proof-zk-backend.workspace = true
 base-prover-service-client.workspace = true
 base-prover-service-protocol.workspace = true
-base-proof-succinct-host-utils.workspace = true
-base-proof-succinct-proof-utils.workspace = true
-
-# SP1 / cluster
-sp1-cluster-utils.workspace = true
-sp1-cluster-common.workspace = true
-sp1-cluster-artifact.workspace = true
-sp1-sdk = { workspace = true, features = ["network"] }
 
 # CLI / errors
 eyre.workspace = true
@@ -39,7 +31,6 @@ serde = { workspace = true, features = ["derive", "std"] }
 
 # Async
 tokio-util.workspace = true
-tokio = { workspace = true, features = ["full"] }
 
 # URL / identifiers
 url.workspace = true

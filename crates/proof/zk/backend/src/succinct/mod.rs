@@ -6,14 +6,15 @@
 mod provider;
 pub use provider::{L1HeadSource, OpSuccinctWitnessProvider, WitnessError, WitnessParams};
 
-mod cluster;
-pub use cluster::{ClusterSessionId, ClusterZkProver, ClusterZkProverConfig};
+mod builder;
+pub use builder::{
+    SuccinctBackendBuildError, SuccinctBackendBuildResult, SuccinctBackendBuilder,
+    SuccinctBackendKind, SuccinctClusterBackendConfig, SuccinctNetworkBackendConfig,
+    SuccinctNetworkFulfillmentStrategy, SuccinctNetworkRequester,
+};
 
-mod network;
-pub use network::{NetworkZkProver, NetworkZkProverConfig};
-
-mod dry_run;
-pub use dry_run::{DRY_RUN_SNARK_PREFIX, DryRunZkProver};
-
-mod mock;
-pub use mock::{MOCK_PROOF_BYTES, MOCK_SNARK_PREFIX, MockZkProver};
+mod backends;
+pub use backends::{
+    ClusterSessionId, ClusterZkProver, ClusterZkProverConfig, DRY_RUN_SNARK_PREFIX, DryRunZkProver,
+    MOCK_PROOF_BYTES, MOCK_SNARK_PREFIX, MockZkProver, NetworkZkProver, NetworkZkProverConfig,
+};

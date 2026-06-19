@@ -1,29 +1,25 @@
 //! CLI definition for the ZK prover host worker binary.
 
-use std::{error::Error, fmt, sync::Arc, time::Duration};
+use std::{fmt, time::Duration};
 
 use base_cli_utils::{LogConfig, RuntimeManager};
-use base_proof_succinct_host_utils::fetcher::{OPSuccinctDataFetcher, RPCConfig};
-use base_proof_succinct_proof_utils::{ClusterArtifactStore, ClusterProofConfig};
 use base_proof_worker::{
     DEFAULT_JOB_DISCOVERY_LOCK_DURATION_SECONDS, DEFAULT_JOB_DISCOVERY_MAX_CONCURRENT_JOBS,
     ZkProofClaimType,
 };
 use base_proof_zk_backend::{
-    ClusterZkProver, ClusterZkProverConfig, DryRunZkProver, MockZkProver, NetworkZkProver,
-    NetworkZkProverConfig, OpSuccinctWitnessProvider,
+    SuccinctBackendBuilder, SuccinctBackendKind, SuccinctClusterBackendConfig,
+    SuccinctNetworkBackendConfig, SuccinctNetworkFulfillmentStrategy, SuccinctNetworkRequester,
 };
 use base_proof_zk_host::{
     DEFAULT_PROOF_GENERATOR_HEARTBEAT_LOCK_DURATION_SECONDS,
     DEFAULT_PROOF_GENERATOR_MAX_CONSECUTIVE_HEARTBEAT_FAILURES, ProofGeneratorHeartbeatConfig,
-    ZkHost, ZkHostConfig, ZkProver,
+    ZkHost, ZkHostConfig,
 };
 use base_prover_service_client::{ProverServiceClientConfig, ProverWorkerClient};
 use base_prover_service_protocol::ZkVm;
 use clap::{Parser, ValueEnum};
 use eyre::{WrapErr, eyre};
-use sp1_cluster_common::client::ClusterServiceClient;
-use sp1_sdk::network::{FulfillmentStrategy, NetworkMode, signer::NetworkSigner};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use url::Url;
@@ -68,20 +64,36 @@ struct WorkerArgs {
     backend: ZkBackendArg,
 
     /// Base consensus node RPC URL. Required for `ZK_BACKEND=cluster` or `network`.
-    #[arg(long, env = "BASE_CONSENSUS_ADDRESS")]
-    base_consensus_address: Option<String>,
+    #[arg(
+        long,
+        env = "BASE_CONSENSUS_ADDRESS",
+        required_if_eq_any([("backend", "cluster"), ("backend", "network")])
+    )]
+    base_consensus_address: Option<Url>,
 
     /// L1 execution node RPC URL. Required for `ZK_BACKEND=cluster` or `network`.
-    #[arg(long, env = "L1_NODE_ADDRESS")]
-    l1_node_address: Option<String>,
+    #[arg(
+        long,
+        env = "L1_NODE_ADDRESS",
+        required_if_eq_any([("backend", "cluster"), ("backend", "network")])
+    )]
+    l1_node_address: Option<Url>,
 
     /// L1 beacon node RPC URL. Required for `ZK_BACKEND=cluster` or `network`.
-    #[arg(long, env = "L1_BEACON_ADDRESS")]
-    l1_beacon_address: Option<String>,
+    #[arg(
+        long,
+        env = "L1_BEACON_ADDRESS",
+        required_if_eq_any([("backend", "cluster"), ("backend", "network")])
+    )]
+    l1_beacon_address: Option<Url>,
 
     /// L2 execution node RPC URL. Required for `ZK_BACKEND=cluster` or `network`.
-    #[arg(long, env = "L2_NODE_ADDRESS")]
-    l2_node_address: Option<String>,
+    #[arg(
+        long,
+        env = "L2_NODE_ADDRESS",
+        required_if_eq_any([("backend", "cluster"), ("backend", "network")])
+    )]
+    l2_node_address: Option<Url>,
 
     /// Default sequence window for L1 head calculations.
     #[arg(long, env = "DEFAULT_SEQUENCE_WINDOW", default_value_t = 50)]
@@ -237,6 +249,17 @@ impl ZkBackendArg {
     }
 }
 
+impl From<ZkBackendArg> for SuccinctBackendKind {
+    fn from(backend: ZkBackendArg) -> Self {
+        match backend {
+            ZkBackendArg::Mock => Self::Mock,
+            ZkBackendArg::DryRun => Self::DryRun,
+            ZkBackendArg::Cluster => Self::Cluster,
+            ZkBackendArg::Network => Self::Network,
+        }
+    }
+}
+
 /// SP1 network fulfillment strategy argument.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Sp1FulfillmentStrategyArg {
@@ -248,84 +271,13 @@ enum Sp1FulfillmentStrategyArg {
     Auction,
 }
 
-impl From<Sp1FulfillmentStrategyArg> for FulfillmentStrategy {
+impl From<Sp1FulfillmentStrategyArg> for SuccinctNetworkFulfillmentStrategy {
     fn from(strategy: Sp1FulfillmentStrategyArg) -> Self {
         match strategy {
             Sp1FulfillmentStrategyArg::Reserved => Self::Reserved,
             Sp1FulfillmentStrategyArg::Hosted => Self::Hosted,
             Sp1FulfillmentStrategyArg::Auction => Self::Auction,
         }
-    }
-}
-
-struct RequiredRpcArgs<'a> {
-    base_consensus_url: &'a str,
-    l1_node_url: &'a str,
-    l1_beacon_url: &'a str,
-    l2_node_url: &'a str,
-}
-
-struct ClusterArtifactStoreConfig {
-    store: ClusterArtifactStore,
-    request_config: sp1_cluster_utils::ArtifactStoreConfig,
-}
-
-/// Adapter for boxed errors returned by upstream `anyhow` APIs.
-#[derive(Debug)]
-struct BoxedStdError(Box<dyn Error + Send + Sync + 'static>);
-
-impl BoxedStdError {
-    fn new(error: Box<dyn Error + Send + Sync + 'static>) -> Self {
-        Self(error)
-    }
-}
-
-impl fmt::Display for BoxedStdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl Error for BoxedStdError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl<'a> TryFrom<&'a WorkerArgs> for RequiredRpcArgs<'a> {
-    type Error = eyre::Report;
-
-    fn try_from(args: &'a WorkerArgs) -> Result<Self, Self::Error> {
-        Ok(Self {
-            base_consensus_url: args.base_consensus_address.as_deref().ok_or_else(|| {
-                eyre!("BASE_CONSENSUS_ADDRESS must be set for the selected ZK_BACKEND")
-            })?,
-            l1_node_url: args
-                .l1_node_address
-                .as_deref()
-                .ok_or_else(|| eyre!("L1_NODE_ADDRESS must be set for the selected ZK_BACKEND"))?,
-            l1_beacon_url: args.l1_beacon_address.as_deref().ok_or_else(|| {
-                eyre!("L1_BEACON_ADDRESS must be set for the selected ZK_BACKEND")
-            })?,
-            l2_node_url: args
-                .l2_node_address
-                .as_deref()
-                .ok_or_else(|| eyre!("L2_NODE_ADDRESS must be set for the selected ZK_BACKEND"))?,
-        })
-    }
-}
-
-impl TryFrom<&RequiredRpcArgs<'_>> for RPCConfig {
-    type Error = eyre::Report;
-
-    fn try_from(args: &RequiredRpcArgs<'_>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            l1_rpc: Url::parse(args.l1_node_url).wrap_err("invalid L1 RPC URL")?,
-            l1_beacon_rpc: Some(Url::parse(args.l1_beacon_url).wrap_err("invalid beacon RPC URL")?),
-            l2_rpc: Url::parse(args.l2_node_url).wrap_err("invalid L2 RPC URL")?,
-            l2_node_rpc: Url::parse(args.base_consensus_url)
-                .wrap_err("invalid Base consensus RPC URL")?,
-        })
     }
 }
 
@@ -356,7 +308,57 @@ impl Worker {
             ));
         }
         let proof_type = ZkProofClaimType::from(args.proof_type);
-        let prover = self.build_backend().await?;
+        info!(
+            prover_service_endpoint = %args.prover_service_endpoint,
+            proof_type = ?proof_type,
+            backend = %args.backend,
+            "initializing zk prover host worker"
+        );
+        let backend_builder = SuccinctBackendBuilder {
+            backend: args.backend.into(),
+            base_consensus_rpc: args.base_consensus_address.clone(),
+            l1_rpc: args.l1_node_address.clone(),
+            l1_beacon_rpc: args.l1_beacon_address.clone(),
+            l2_rpc: args.l2_node_address.clone(),
+            default_sequence_window: args.default_sequence_window,
+            cluster: SuccinctClusterBackendConfig {
+                cluster_rpc_endpoint: args.sp1_cluster_api_endpoint.clone(),
+                s3_bucket: args.cli_s3_bucket.clone(),
+                s3_region: args.cli_s3_region.clone(),
+                timeout_hours: args.sp1_cluster_timeout_hours,
+            },
+            network: SuccinctNetworkBackendConfig {
+                requester: args.network_private_key.as_ref().map(|key| {
+                    if args.use_kms_requester {
+                        SuccinctNetworkRequester::AwsKmsKeyId(key.clone())
+                    } else {
+                        SuccinctNetworkRequester::LocalPrivateKey(key.clone())
+                    }
+                }),
+                fulfillment_strategy: args.sp1_fulfillment_strategy.into(),
+                timeout_hours: args.sp1_network_timeout_hours,
+            },
+            range_cycle_limit: args.range_cycle_limit,
+            range_gas_limit: args.range_gas_limit,
+        };
+        let Some(prover) =
+            backend_builder.build(&cancel).await.wrap_err("failed to initialize ZK backend")?
+        else {
+            info!(
+                proof_type = ?proof_type,
+                backend = %args.backend,
+                "zk prover host worker initialization cancelled"
+            );
+            return Ok(());
+        };
+        if cancel.is_cancelled() {
+            info!(
+                proof_type = ?proof_type,
+                backend = %args.backend,
+                "zk prover host worker startup cancelled"
+            );
+            return Ok(());
+        }
 
         let client_config = ProverServiceClientConfig::new(args.prover_service_endpoint.clone())
             .with_request_timeout(Duration::from_secs(args.prover_service_request_timeout_secs));
@@ -388,177 +390,5 @@ impl Worker {
         );
         host.run_until_cancelled(cancel).await;
         Ok(())
-    }
-
-    /// Selects the [`ZkProver`] backend implementation from CLI/env settings.
-    async fn build_backend(&self) -> eyre::Result<Arc<dyn ZkProver>> {
-        match self.args.backend {
-            ZkBackendArg::Mock => Ok(Arc::new(MockZkProver)),
-            ZkBackendArg::DryRun => Ok(Arc::new(DryRunZkProver)),
-            ZkBackendArg::Cluster => self.build_cluster_backend().await,
-            ZkBackendArg::Network => self.build_network_backend().await,
-        }
-    }
-
-    async fn build_cluster_backend(&self) -> eyre::Result<Arc<dyn ZkProver>> {
-        let args = &self.args;
-        let rpc_args = RequiredRpcArgs::try_from(args)?;
-        let cluster_rpc = args.sp1_cluster_api_endpoint.as_deref().ok_or_else(|| {
-            eyre!("SP1_CLUSTER_API_ENDPOINT must be set for the selected ZK_BACKEND")
-        })?;
-
-        info!("ZK_BACKEND=cluster: using Succinct SP1 cluster backend");
-        let provider = self.build_witness_provider(&rpc_args).await?;
-        let artifact_store = self.cluster_artifact_store().await?;
-        let service_client = ClusterServiceClient::new(cluster_rpc.to_owned())
-            .await
-            .wrap_err("failed to create SP1 cluster client")?;
-        let timeout_secs = args
-            .sp1_cluster_timeout_hours
-            .checked_mul(3600)
-            .ok_or_else(|| eyre!("SP1_CLUSTER_TIMEOUT_HOURS is too large"))?;
-        let config = ClusterZkProverConfig {
-            base_consensus_url: rpc_args.base_consensus_url.to_owned(),
-            l1_node_url: rpc_args.l1_node_url.to_owned(),
-            default_sequence_window: args.default_sequence_window,
-            cluster: Arc::new(ClusterProofConfig {
-                cluster_rpc: cluster_rpc.to_owned(),
-                artifact_store: artifact_store.store,
-                artifact_store_config: artifact_store.request_config,
-                service_client,
-            }),
-            timeout: Duration::from_secs(timeout_secs),
-            range_cycle_limit: args.range_cycle_limit,
-            range_gas_limit: args.range_gas_limit,
-        };
-
-        Ok(Arc::new(ClusterZkProver::new(provider, config)))
-    }
-
-    async fn build_network_backend(&self) -> eyre::Result<Arc<dyn ZkProver>> {
-        let args = &self.args;
-        let rpc_args = RequiredRpcArgs::try_from(args)?;
-
-        info!("ZK_BACKEND=network: using Succinct SP1 Network backend");
-        info!("computing range proving key");
-        let (range_pk, _range_vk, _agg_pk, _agg_vk) =
-            base_proof_succinct_proof_utils::cluster_setup_keys().await.map_err(|e| {
-                eyre::Report::new(BoxedStdError::new(e.into_boxed_dyn_error()))
-                    .wrap_err("failed to compute proving keys")
-            })?;
-        info!("range proving key computed successfully");
-
-        let provider = self.build_witness_provider(&rpc_args).await?;
-
-        let fulfillment_strategy = FulfillmentStrategy::from(args.sp1_fulfillment_strategy);
-        let network_mode = match fulfillment_strategy {
-            FulfillmentStrategy::Auction => NetworkMode::Mainnet,
-            FulfillmentStrategy::Hosted | FulfillmentStrategy::Reserved => NetworkMode::Reserved,
-            _ => {
-                return Err(eyre!(
-                    "fulfillment strategy must be 'reserved', 'hosted', or 'auction'"
-                ));
-            }
-        };
-        let network_signer = self.network_signer().await?;
-
-        info!(
-            network_mode = ?network_mode,
-            fulfillment_strategy = ?fulfillment_strategy,
-            "creating SP1 Network prover"
-        );
-        let network_prover = Arc::new(
-            sp1_sdk::ProverClient::builder()
-                .network_for(network_mode)
-                .signer(network_signer)
-                .build()
-                .await,
-        );
-
-        let timeout_secs = args
-            .sp1_network_timeout_hours
-            .checked_mul(3600)
-            .ok_or_else(|| eyre!("SP1_NETWORK_TIMEOUT_HOURS is too large"))?;
-        let config = NetworkZkProverConfig {
-            base_consensus_url: rpc_args.base_consensus_url.to_owned(),
-            l1_node_url: rpc_args.l1_node_url.to_owned(),
-            default_sequence_window: args.default_sequence_window,
-            network_prover,
-            range_pk: range_pk.into(),
-            fulfillment_strategy,
-            timeout: Duration::from_secs(timeout_secs),
-            range_cycle_limit: args.range_cycle_limit,
-            range_gas_limit: args.range_gas_limit,
-        };
-
-        Ok(Arc::new(NetworkZkProver::new(provider, config)))
-    }
-
-    async fn build_witness_provider(
-        &self,
-        rpc_args: &RequiredRpcArgs<'_>,
-    ) -> eyre::Result<OpSuccinctWitnessProvider> {
-        let rpc_config = RPCConfig::try_from(rpc_args)?;
-        let fetcher = Arc::new(
-            OPSuccinctDataFetcher::from_rpc_config_with_rollup_config(rpc_config).await.map_err(
-                |e| {
-                    eyre::Report::new(BoxedStdError::new(e.into_boxed_dyn_error()))
-                        .wrap_err("failed to create OPSuccinctDataFetcher")
-                },
-            )?,
-        );
-
-        Ok(OpSuccinctWitnessProvider::new(fetcher))
-    }
-
-    async fn cluster_artifact_store(&self) -> eyre::Result<ClusterArtifactStoreConfig> {
-        let args = &self.args;
-        let bucket = args
-            .cli_s3_bucket
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| eyre!("CLI_S3_BUCKET is required for ZK_BACKEND=cluster"))?
-            .to_owned();
-        let region = args
-            .cli_s3_region
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| eyre!("CLI_S3_REGION is required for ZK_BACKEND=cluster"))?
-            .to_owned();
-
-        info!("using S3 artifact storage");
-        let client = sp1_cluster_artifact::s3::S3ArtifactClient::new(
-            region.clone(),
-            bucket.clone(),
-            32,
-            sp1_cluster_artifact::s3::S3DownloadMode::AwsSDK(
-                sp1_cluster_artifact::s3::S3ArtifactClient::create_s3_sdk_download_client(
-                    region.clone(),
-                )
-                .await,
-            ),
-        )
-        .await;
-
-        Ok(ClusterArtifactStoreConfig {
-            store: ClusterArtifactStore::S3(client),
-            request_config: sp1_cluster_utils::ArtifactStoreConfig::S3 { bucket, region },
-        })
-    }
-
-    async fn network_signer(&self) -> eyre::Result<NetworkSigner> {
-        let args = &self.args;
-        let key = args
-            .network_private_key
-            .as_deref()
-            .ok_or_else(|| eyre!("NETWORK_PRIVATE_KEY must be set for the selected ZK_BACKEND"))?;
-
-        if args.use_kms_requester {
-            NetworkSigner::aws_kms(key).await.wrap_err("failed to create KMS network signer")
-        } else {
-            NetworkSigner::local(key).wrap_err("failed to create local network signer")
-        }
     }
 }

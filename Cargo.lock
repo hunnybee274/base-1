@@ -5911,13 +5911,17 @@ dependencies = [
  "bincode 2.0.1",
  "serde",
  "serde_json",
+ "sp1-cluster-artifact",
  "sp1-cluster-common",
+ "sp1-cluster-utils",
  "sp1-prover-types",
  "sp1-sdk",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tonic 0.14.6",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -6190,8 +6194,6 @@ name = "base-prover-zk-host"
 version = "0.0.0"
 dependencies = [
  "base-cli-utils",
- "base-proof-succinct-host-utils",
- "base-proof-succinct-proof-utils",
  "base-proof-worker",
  "base-proof-zk-backend",
  "base-proof-zk-host",
@@ -6200,11 +6202,6 @@ dependencies = [
  "clap",
  "eyre",
  "serde",
- "sp1-cluster-artifact",
- "sp1-cluster-common",
- "sp1-cluster-utils",
- "sp1-sdk",
- "tokio",
  "tokio-util",
  "tracing",
  "url",
