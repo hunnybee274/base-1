@@ -21,3 +21,6 @@ pub use proof_generator::{
     MIN_PROOF_GENERATOR_POLL_INTERVAL, ProofGenerator, ProofGeneratorError,
     ProofGeneratorHeartbeatConfig, ProofGeneratorRequest,
 };
+
+mod host;
+pub use host::{ZkHost, ZkHostConfig};
