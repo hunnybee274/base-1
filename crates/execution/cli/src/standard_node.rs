@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use base_bundle_extension::BundleExtension;
+use base_execution_eip8130_rpc_node::Eip8130RpcExtension;
 use base_flashblocks::FlashblocksConfig;
 use base_flashblocks_node::FlashblocksExtension;
 use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension, MeteringResourceLimits};
@@ -267,7 +268,9 @@ impl StandardBaseRethNode {
         runner.install_ext::<MeteringExtension>(metering_config);
         runner.install_ext::<BundleExtension>(());
         runner.install_ext::<TxForwardingExtension>((&args).into());
+        let flashblocks_enabled = flashblocks_config.is_some();
         runner.install_ext::<FlashblocksExtension>(flashblocks_config);
+        runner.install_ext::<Eip8130RpcExtension>(!flashblocks_enabled);
         runner.install_ext::<ProofsHistoryExtension>(args.rpc.rollup_args);
 
         Ok(runner)

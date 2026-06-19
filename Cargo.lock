@@ -4406,6 +4406,7 @@ dependencies = [
  "base-common-consensus",
  "base-execution-chainspec",
  "base-execution-consensus",
+ "base-execution-eip8130-rpc-node",
  "base-execution-evm",
  "base-execution-trie",
  "base-flashblocks",
@@ -4518,6 +4519,15 @@ dependencies = [
  "reth-provider",
  "reth-rpc-eth-api",
  "reth-rpc-eth-types",
+ "tracing",
+]
+
+[[package]]
+name = "base-execution-eip8130-rpc-node"
+version = "0.0.0"
+dependencies = [
+ "base-execution-eip8130-rpc",
+ "base-node-runner",
  "tracing",
 ]
 
