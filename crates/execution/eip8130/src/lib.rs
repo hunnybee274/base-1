@@ -44,3 +44,12 @@ pub use validate::{NonceMode, NonceStatus, NonceValidator};
 
 mod transaction;
 pub use transaction::{AuthorizedTransaction, TransactionAuthorizer};
+
+mod schedule;
+pub use schedule::Eip8130GasSchedule;
+
+mod intrinsic;
+pub use intrinsic::{AuthWireForm, IntrinsicGas, IntrinsicGasError, IntrinsicGasInput};
+
+mod fee;
+pub use fee::{FeeCheck, FeeError};
