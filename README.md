@@ -8,7 +8,7 @@ Base is a rollup built on Ethereum.
 - **Cheap, fast, and open platform:** Base is a globally available platform that provides 1-second and <1-cent transactions to anyone in the world.
 - **Reach more users:** Base is committed to helping developers grow their user base by distributing their apps through official Base channels.
 - **A place to earn:** Base has delivered grants to more than 1,000 builders, with plans to continue supporting more.
-- **Access to high-quality tooling:** Builders have access to tools to build incredible onchain experiences for AI, social, media, and entertainment.
+- **Access to high-quality tooling:** Builders have access to tools to build incredible onchain experiences for AI, social, media,raddit and entertainment.
 
 ## Learn More
 
